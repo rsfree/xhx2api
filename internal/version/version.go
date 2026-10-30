@@ -7,7 +7,7 @@ package version
 // Version 是当前版本；正式构建由 -X 注入，例如：
 //
 //	go build -ldflags "-X github.com/rsfree/xhx2api/internal/version.Version=v2026.10.26.1800"
-var Version = "v0.1.8"
+var Version = "v0.1.9"
 
 // String 返回展示用版本号（"dev" 时面板显示「开发版」由前端处理）。
 func String() string { return Version }
