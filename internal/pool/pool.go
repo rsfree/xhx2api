@@ -433,8 +433,9 @@ func (p *Pool) pickLocked(exclude map[string]bool, minCredits int64, requireUnde
 	// 在途上限：先按上限过滤。
 	//
 	// 这里是**软**上限：全都满了还是挑一个（多排一个总比直接拒好）。
-	// 硬性等待在 PickWait 里做——因为上游确实有并发限制：实测单账号
-	// 并发 10 以内全成功，12 开始回 429 limiter_request_error。
+	// 硬性等待在 PickWait 里做——因为上游确实有并发限制：2026-11-01 三账号
+	// 两个模型实测，单账号**第 6 个**在途请求起就 429（0.1s 内、不排队），
+	// 且额度按账号算、跨模型共享。超发不会「多挤一个」，只会把号打进去。
 	under := candidates[:0]
 	for _, uid := range candidates {
 		if inflight[uid] < p.cfg.MaxInFlight {

@@ -37,7 +37,7 @@
   },
   "pool": {
     "strategy": "round_robin",
-    "max_in_flight": 10,
+    "max_in_flight": 5,
     "queue_wait": "2s",
     "breaker_threshold": 3,
     "breaker_cooldown": "10m",

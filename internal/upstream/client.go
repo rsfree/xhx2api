@@ -316,8 +316,9 @@ type Client struct {
 	ImageHTTP *http.Client
 	imageOnce sync.Once
 
-	timeoutMu   sync.RWMutex
-	idleTimeout time.Duration
+	timeoutMu     sync.RWMutex
+	idleTimeout   time.Duration
+	headerTimeout time.Duration
 
 	hostMu sync.RWMutex
 	llm    string
@@ -361,13 +362,14 @@ type refreshFlight struct {
 func New() *Client {
 	tr := newTransport(120 * time.Second)
 	return &Client{
-		HTTP:       &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		StreamHTTP: &http.Client{Transport: tr},
-		llm:        LLMBase,
-		auth:       AuthBase,
-		points:     PointsBase,
-		origin:     Origin,
-		flights:    map[string]*refreshFlight{},
+		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		StreamHTTP:    &http.Client{Transport: tr},
+		headerTimeout: 120 * time.Second,
+		llm:           LLMBase,
+		auth:          AuthBase,
+		points:        PointsBase,
+		origin:        Origin,
+		flights:       map[string]*refreshFlight{},
 	}
 }
 
@@ -409,6 +411,7 @@ func (c *Client) SetTimeouts(short, header, idle time.Duration) {
 			}
 		}
 	}
+	c.headerTimeout = header
 	c.idleTimeout = idle
 }
 
@@ -417,6 +420,13 @@ func (c *Client) IdleTimeout() time.Duration {
 	c.timeoutMu.RLock()
 	defer c.timeoutMu.RUnlock()
 	return c.idleTimeout
+}
+
+// HeaderTimeout 返回等响应头的上限（0 = 未设置）。
+func (c *Client) HeaderTimeout() time.Duration {
+	c.timeoutMu.RLock()
+	defer c.timeoutMu.RUnlock()
+	return c.headerTimeout
 }
 
 // SetIdentity 覆盖出站 User-Agent 与客户端版本头（空 = 用内置默认）。
@@ -851,7 +861,16 @@ func (c *Client) GetUserInfo(ctx context.Context, a *auth.Auth) (uid, nickname, 
 // 哪一次请求——积分对账完全靠它。
 func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte, turnTitle string) (io.ReadCloser, int, []byte, error) {
 	url := c.llmBase() + ChatPath
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	// 派生一个可取消的 ctx：流内空闲看门狗靠它把卡死的流掐断。
+	reqCtx, cancel := context.WithCancel(ctx)
+	handedOff := false
+	defer func() {
+		// 没把流交出去（早退/报错）时立刻回收，避免计时器和连接悬着。
+		if !handedOff {
+			cancel()
+		}
+	}()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, 500, nil, &Error{Kind: ErrServer, Status: 500, Msg: "构造小浣熊上游请求失败"}
 	}
@@ -874,6 +893,13 @@ func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte, turn
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, 499, nil, &Error{Kind: ErrClient, Status: 499, Msg: "客户端已断开"}
+		}
+		// 等响应头超时**不是**连不上：以前这里一律记成 server，handler 就按
+		// 「值得换号」处理，一个慢上游被 3 个账号各等 120s 才收场（线上实测
+		// 单请求 360s），还给这 3 个无辜账号各记一次失败、可能触发熔断。
+		// 超时换号没有意义（换个号一样慢），所以归到 gateway：快速失败、不罚号。
+		if isTimeoutErr(err) {
+			return nil, 504, nil, &Error{Kind: ErrGateway, Status: 504, Msg: c.timeoutMessage()}
 		}
 		return nil, 502, nil, &Error{Kind: ErrServer, Status: 502, Msg: "无法连接小浣熊，请检查网络或代理设置"}
 	}
@@ -912,10 +938,14 @@ func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte, turn
 
 	// HTTP 200 也可能是错误：上游会用一帧 {"error":{...}} 表达限流/额度。
 	// 只看状态码会把它当成功，账号也就没法换——所以先窥一帧再交出去。
-	br := newPeekReader(resp.Body)
+	br := newPeekReader(newIdleBody(resp.Body, c.IdleTimeout(), cancel))
 	first, err := br.peekFrame()
 	if err != nil {
 		_ = resp.Body.Close()
+		var ue *Error
+		if errors.As(err, &ue) {
+			return nil, ue.Status, nil, ue
+		}
 		return nil, 502, nil, &Error{Kind: ErrServer, Status: 502, Msg: "读取上游首帧失败"}
 	}
 	if first.Kind == sseError {
@@ -925,7 +955,86 @@ func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte, turn
 			RetryAfterSecs: first.RetryAfterSecs, ServiceUnavailable: first.ServiceUnavailable,
 		}
 	}
+	handedOff = true
 	return br.stream(), resp.StatusCode, nil, nil
+}
+
+// isTimeoutErr 判断传输层错误是「等超时」还是「连不上」。
+//
+// net/http 的 ResponseHeaderTimeout / Client.Timeout / 读超时都实现 Timeout() bool；
+// 连接被拒、DNS 失败、TLS 握手失败则不然。两者的处理恰好相反。
+func isTimeoutErr(err error) bool {
+	var t interface{ Timeout() bool }
+	if errors.As(err, &t) && t.Timeout() {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+// timeoutMessage 说明等的是哪个窗口，避免把「上游慢」读成「网络不通」。
+func (c *Client) timeoutMessage() string {
+	if d := c.HeaderTimeout(); d > 0 {
+		return fmt.Sprintf("上游响应超时（等响应头超过 %s），请稍后重试", d)
+	}
+	return "上游响应超时，请稍后重试"
+}
+
+// idleBody 给流式响应加「流内空闲上限」。
+//
+// http.Client 没有「两次 Read 之间最多等多久」这种能力：ResponseHeaderTimeout
+// 只管响应头，服务端 ReadTimeout 只管读请求体。于是一条已经回了 200、但上游
+// 卡住不吐字节的流会一直挂着——2026-10-31 线上实测出现过 877s 才结束的请求，
+// 期间它一直占着连接和一个在途名额。
+//
+// 这里在每次读到字节后重置计时，超时就 cancel 掉这次上游请求：读端立刻拿到
+// 错误，在途名额随之释放。错误必须包成 *Error，分类器才能判成 gateway
+// （超时是上游的事，不该罚账号）。
+type idleBody struct {
+	rc     io.ReadCloser
+	idle   time.Duration
+	cancel context.CancelFunc
+	timer  *time.Timer
+
+	mu    sync.Mutex
+	fired bool
+}
+
+func newIdleBody(rc io.ReadCloser, idle time.Duration, cancel context.CancelFunc) io.ReadCloser {
+	b := &idleBody{rc: rc, idle: idle, cancel: cancel}
+	if idle > 0 {
+		b.timer = time.AfterFunc(idle, func() {
+			b.mu.Lock()
+			b.fired = true
+			b.mu.Unlock()
+			cancel()
+		})
+	}
+	return b
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	if n > 0 && b.timer != nil {
+		b.timer.Reset(b.idle)
+	}
+	if err != nil {
+		b.mu.Lock()
+		fired := b.fired
+		b.mu.Unlock()
+		if fired {
+			return n, &Error{Kind: ErrGateway, Status: 504,
+				Msg: fmt.Sprintf("上游流空闲超过 %s 没有新内容，已断开", b.idle)}
+		}
+	}
+	return n, err
+}
+
+func (b *idleBody) Close() error {
+	if b.timer != nil {
+		b.timer.Stop()
+	}
+	b.cancel()
+	return b.rc.Close()
 }
 
 // PrepareBody 是入站体的轻量规整钩子：小浣熊原样透传，这里不改任何字段。

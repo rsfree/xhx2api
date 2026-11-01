@@ -290,7 +290,10 @@ func defaults() *Config {
 	c.Cooldown.SoftRate = "60s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Pool.Strategy = "round_robin"
-	c.Pool.MaxInFlight = 10
+	// 上游单账号硬上限是 5 个在途（2026-11-01 三账号两模型实测：第 6 个起
+	// 0.1s 内直接 429，不排队）。网关这边对齐到上限，超发只会把号打进
+	// 上游的频率惩罚（全模型 429，实测 ≥30 分钟），比排队等待贵得多。
+	c.Pool.MaxInFlight = 5
 	c.Pool.QueueWait = "2s"
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "10m"

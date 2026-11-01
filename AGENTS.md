@@ -46,6 +46,8 @@ tag 与 `latest`（默认分支）。
 | `max_tokens:16/512` 正文回空、`finish_reason=length` | 思考 token 算在输出额度里；768 起稳定，1024 留余量 | `server/bodyfix.go` `liftMaxTokens` |
 | body 里带 `title` → HTTP 500 `Unexpected keyword argument 'title'` | `raccoon-*` 对未知字段严格校验（`sn-*` 会忽略）；title 只能走 Header | `server/bodyfix.go` `stripTurnTitle` |
 | 参数类错误以 5xx 返回 | 必须先判文案再判状态码，否则一次参数错误就熔断好号 | `upstream.Classify` 的 `paramErrorSignal` |
+| 等响应头超时曾被当成「连不上」 | 一律记 server → handler 换号重试 3 次，一次请求白耗 360s，还给 3 个无辜账号各记一次失败。现按 `isTimeoutErr` 判成 gateway：504、不换号、不罚号 | `client.go` 的 `isTimeoutErr` / `timeoutMessage` |
+| 流内空闲没有上限 | `upstream.idle_timeout_seconds` 一直是死配置（`IdleTimeout()` 无人调用），上游卡住不吐字节时请求能挂 877s，全程占着连接和在途名额 | `client.go` 的 `idleBody` 看门狗 |
 | 单账号 + 首次 5xx 后返回「没有可用账号」 | 换号无候选时不要用 no_account 盖掉真实错误 | `handler.go` 的 `lastErr` 保留 |
 | 桌面端 `agent/config/auth.json` 只有 `access_token`（IAM 票，30 天，无 refresh） | 「客户端目录」导入走这条路；覆盖导入必须继承旧 `refresh_token` + 余额/签到快照，否则账号会降级（`panel.mergeExisting`，测试 `TestMergeExistingKeepsSnapshot`） | `internal/clientdir`、`panel.mergeExisting` |
 | 手机号登录三件套 `send_sms` / `login_with_sms` / `user_info` | phone/password 必须 AES-128-CFB 加密（`base64(iv‖ct)`，密钥 `senseraccoon2023`）；明文 → `params_encryted_error` | `upstream.EncryptCredential`、`authapi.go` |
@@ -76,7 +78,7 @@ tag 与 `latest`（默认分支）。
 | 生图 size | **两条约束**：①最长边 ≤ 3840（超了先跑 106s 再 400）；②总像素 ≤ 8,294,400 = 3840×2160（超了**不报错**，静默降级：3840x3840 → 2880x2880）。实测 `1024x1024`→196 tokens、`1536x1024`→158、`1792x1024`→139、`3840x2160`(4K)→371 | `upstream.ClampImageSize` 提前按两条约束等比压，响应头 `X-XHX-Image-Size` |
 | 4K + quality | `3840x2160&quality=high` → 13342 image_tokens（默认档 371，36 倍）、136s、1806KB；quality 对耗时几乎无影响 | 同上 |
 | 生图默认值 | `size` 省略 → 上游给 **1254x1254**（229 tokens）；`size=auto` → **1024x1024**（196）——两者不一样。`quality` 省略恒为 `low` | `probe_4k.py ""` / `size=auto` |
-| 生图并发 | 单账号 **10 上限**（与对话共用配额）：4 并发 4/4（167s）、8 并发 8/8（100s）、12 并发 10/12（2 个 429）。429 正文 `code 200103 limiter_request_error`、`retry after:0s`、0.1s 立即返回；**等 1s 重试 12/12 全成功** → `serveImage` 原地等 2s 重试，不换号不罚号 | `imageRateRetryDelay`、`pool.max_in_flight=10` |
+| 生图并发 | 单账号 **10 上限**（与对话共用配额；⚠️ 2026-11-01 对话侧复测已降到 **5**，生图是否同步收紧未复测，按 5 规划更安全）：4 并发 4/4（167s）、8 并发 8/8（100s）、12 并发 10/12（2 个 429）。429 正文 `code 200103 limiter_request_error`、`retry after:0s`、0.1s 立即返回；**等 1s 重试 12/12 全成功** → `serveImage` 原地等 2s 重试，不换号不罚号 | `imageRateRetryDelay`、`pool.max_in_flight` |
 | 生图混跑 | 8 生图 + 4 对话（同账号、对话延后 1s）12 个全过 → 429 看瞬时峰值，不是严格在途计数 | `img_mixed.py` |
 | 生图全形态（线上） | 9 形态全过：文生图 1024/别名/`quality=high`/4K/超限压缩、图生图 multipart/mask/JSON 内联/多图。耗时 **49-267s**（267s 是 4096x4096 被压到 2880 后），故 `images.timeout_seconds` 默认提到 **600**。图生图确认真用输入图（蓝圆保留、方块按 prompt 由红改金）。tokens：文生图 220 / 图生图 1232 / 双图 2258 / high 7036 | `deploy/ai-prod`、`image_forms_e2e.py` |
 | 生图计费（2026-10-27 受控复测） | 直连上游 66.3s/196 image_tokens、经网关 49.7s/213 tok，两个号余额**与 bill_id 集合均无变化** ⇒ **生图通道本身不扣分**。但**客户端 agent 画图会扣**（`任务消耗 · <会话标题>`，实测 -2/-4/-9）：那是 agent 的 LLM 轮次在花钱，不是生图。查扣费必须按 bill_id 求差集，只看余额会把别的客户端算到自己头上 | `/tmp/billprobe.py`、`/tmp/billdirect.py` |
@@ -88,7 +90,7 @@ tag 与 `latest`（默认分支）。
 | C2PA 取证位置 | C2PA 在 `caBX` 块，**位置在 IDAT 之前**；只扫到 IDAT 就收工会误判成「无元数据」（踩过：把 6 张带签的图判成无签名） | 扫块要走到 `IEND` |
 | 生图耗时与容量 | 单张 20-200s；**与对话并发会抢账号容量**（实测生图 + raccoon-8c4485 并发 → 对话 180s 超时） | `images.timeout_seconds`（默认 300）、超时不换号 |
 | 客户端生图是「可配置 OpenAI 端点」 | 桌面端内置预设指向 `${origin}/api/web/llm/v2/images/gen`，配置项 `{type:remote, endpoint, apiKey, model, timeout}`；说明**客户端把生图当 OpenAI 兼容接口用** | `build/electron/main/client/settings/builtinServiceSettings.js` |
-| 上游并发限制 | 单账号 ≤10 并发全成功，12 起 `429 limiter_request_error`；**按账号算**（两号各 8 并发共 16 全过）。是并发限流不是 TPM | `pool.max_in_flight` 默认 10、`pool.queue_wait` 2s、`Pool.PickWait` |
+| 上游并发限制 | **单账号 5 个在途**（2026-11-01 三账号两模型复测：c=6 → 5/6、c=12 → 5/12，第 6 个起 0.1s 内 429、不排队；按账号算、跨模型共享）。另有第二条闸：累计请求频率打满后**全模型** 429，≥30 分钟才解 | `pool.max_in_flight` 默认 5、`pool.queue_wait` 2s、`Pool.PickWait` |
 | 扫码落地页 `/login/mp` 404 | 轮询端点还在（任意 code 回 pending），二维码改由上游生成；当前实现不可用 | 面板有提示；等逆向出新路径再修 |
 | `X-RACCOON-Title` | 会写进积分流水 `event_name`（「任务消耗 · <title>」），可用来逐笔对账 | `upstream.ChatStream` |
 | 一次 16 token 对话扣 2 分 | 倍率按模型（raccoon x1 / glm-5-3 x0.75 / glm-5-3-flash x0.2） | 面板模型页展示 |

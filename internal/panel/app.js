@@ -585,7 +585,7 @@
         { path: "pool.strategy", label: "选号策略", type: "select", options: [
           ["round_robin", "轮转（默认）"], ["least_in_flight", "最少在途"], ["priority", "优先级"], ["weighted", "加权"],
         ] },
-        { path: "pool.max_in_flight", label: "单号在途上限", type: "number", hint: "实测上游单号并发 ≤10 全成功、12 起 429；求稳可降到 6" },
+        { path: "pool.max_in_flight", label: "单号在途上限", type: "number", hint: "上游单号硬上限 5（第 6 个起立即 429，跨模型共享）；别调高" },
         { path: "pool.queue_wait", label: "名额等待", hint: "全部号都满时最多等多久，如 2s；0 = 不等" },
         { path: "pool.breaker_threshold", label: "熔断阈值", type: "number", hint: "连续失败几次触发熔断" },
         { path: "pool.breaker_cooldown", label: "熔断冷却", hint: "如 10m" },
