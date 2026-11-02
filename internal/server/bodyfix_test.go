@@ -172,6 +172,7 @@ func TestMaxTokensRangeFromError(t *testing.T) {
 		lo, hi int
 	}{
 		{"upstream client (http 400): Range of max_tokens should be [1, 131072] (type: invalid_request_error) (request_id: chatcmpl-5f568a)", 1, 131072},
+		{"upstream client (http 400): max_tokens参数非法：限制数值范围[1,131072] (type: ) (request_id: chatcmpl-789910005bb5)", 1, 131072},
 		{"Range of max_tokens should be [1, 8192]", 1, 8192},
 		{"range of max_tokens should be [ 2 , 4096 ]", 2, 4096},
 		{"invalid temperature: only 1 is allowed for this model", 0, 0},

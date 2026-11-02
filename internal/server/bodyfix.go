@@ -157,11 +157,14 @@ func stripTemperature(body []byte) []byte {
 
 // maxTokensRangeRe 从上游的参数校验报错里取「允许的输出额度区间」。
 //
-// 实测（2026-11-02 线上）：客户端传超范围值时上游回
-// HTTP 400 "Range of max_tokens should be [1, 131072]"。区间按模型/版本会变
-// （目录里的 max_output_tokens 是 100000，与校验上限并不一致），硬编码会在
-// 上游改限后失效，所以按报错原文取。
-var maxTokensRangeRe = regexp.MustCompile(`range of max_tokens should be \[\s*(\d+)\s*,\s*(\d+)\s*\]`)
+// 同一件事上游有两种文案，都得认（2026-11-02 线上实测）：
+//
+//	英文：Range of max_tokens should be [1, 131072]
+//	中文：max_tokens参数非法：限制数值范围[1,131072]
+//
+// 区间按模型/版本会变（目录里的 max_output_tokens 是 100000，与校验上限
+// 并不一致），硬编码会在上游改限后失效，所以按报错原文取。
+var maxTokensRangeRe = regexp.MustCompile(`max_tokens[^\[\]]{0,40}\[\s*(\d+)\s*,\s*(\d+)\s*\]`)
 
 // maxTokensRangeFromError 返回报错里的额度区间；不是这条报错就返回 0, 0。
 func maxTokensRangeFromError(msg string) (lo, hi int) {
