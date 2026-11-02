@@ -678,6 +678,17 @@ go run ./cmd/livecheck -base ... -key ... -all-models
   body 里多一个 `title` 直接 HTTP 500 `Unexpected keyword argument 'title'`。
   网关把它摘出来、转成 `X-RACCOON-Title` 发出去——这一条 Header 会被上游写进
   积分流水的 `event_name`，于是每笔扣费都能反查到是哪次请求。
+- **`temperature` 一律不外发**：上游对思考型模型（实测 `sn-kimi-k3`）只接受
+  `temperature=1`，客户端带 0.7 这类默认值会被直接 HTTP 400
+  `invalid temperature: only 1 is allowed for this model`（2026-11-02 线上，这一条
+  占了当天失败的 57%）。温度对思考型模型本来不生效，网关统一摘掉字段、让上游用
+  自己的默认值；代价是 `raccoon-*` 这类支持温度的模型也退回默认温度。
+- **`max_tokens` 非法值两端都修**：客户端常拿 `-1` 表示「不限」，上游直接 400
+  （文案有英文 `Range of max_tokens should be [1, 131072]`、中文
+  `max_tokens参数非法：限制数值范围[1,131072]`、以及不带区间的
+  `The request parameter max_tokens is invalid or missing` 三种）。所以负数/0 在
+  出站前就抬到下限（2048）；超出报文区间时，按报文里的 `[lo, hi]` 收一次、**同号
+  重试**，不换号也不罚号。
 
 ---
 
