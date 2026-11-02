@@ -70,6 +70,9 @@ tag 与 `latest`（默认分支）。
 | `raccoon-chat-ml-5-5` 计费 | 目录未公布倍率；1,990 token 扣 3 分，与 x1 的 `raccoon-8c4485` 一致 → 按 x1 估 | 模型页「目录外」卡片文案 |
 | 思考吃光额度 | 同一 prompt 的思考量波动 90-4000+ token，`max_tokens=1024` 会偶发「空正文 + finish=length」。默认下限 2048；非流式自动加额到 8192 重试一次；流式补 `reasoning_exhausted` 错误帧 | `bodyfix.go`、`sse.go#finishStream`、`handler.go` 的 escalated |
 | 模型特性 | `sn-*` 全为思考型（一句「收到」烧 21-224 思考 token，首字 5.6-17.4s）；`raccoon-*` 不思考、16 token 结束、首字 14-27s。首字最快 `sn-glm-5-3` | `livecheck -all-models` |
+| `temperature` 只认 1 | `sn-kimi-k3` 带 0.7 直接 HTTP 400 `invalid temperature: only 1 is allowed for this model`（2026-11-02 线上：16 条＝当天 57% 的失败，下游还把 400 当可重试，3 分钟连打 16 次）。温度对思考型模型不生效，出站**一律摘掉**，不做「哪些模型只认 1」的白名单 | `bodyfix.go` 的 `stripTemperature`，测试 `TestStripTemperature` |
+| `max_tokens` 超范围 | 400 `Range of max_tokens should be [1, 131072]`。上限随模型变（目录 `max_output_tokens=100000` 与校验上限并不一致），所以按**报错原文**取上界收一次、同号重试，不换号不罚号 | `handler.go` 的 `clamped`、`bodyfix.go` 的 `clampMaxTokens` |
+| 账号失败率口径 | client/none 只记 `last_error`，不进 Total/Fail/FailCount、不参与平均延迟、不降权。否则下游传错参数就把好号喂到 `DegradeThresh`，账号页成功率也失去意义（历史累计的 429/503 仍会留在数字里） | `pool.release`，测试 `TestClientErrorNotCountedAgainstAccount` |
 | 生图端点 | `POST {llm}/images/gen`，OpenAI Images 形状；**只有 `prompt` 必填**（空值 400 `RelayImageForm.Prompt required`）；`size`/`quality` 生效；上游只回 `data[0].b64_json`，**无 url** | `upstream.GenerateImage`、`server.imageGenerations` |
 | image 字段形态 | 三种都收：单张字符串 / 字符串数组 / `null`（= 无图）；元素可为 data URI 或**裸 base64**（含 URL-safe、缺 padding）。`/v1/images/edits` 收 multipart 与 JSON；multipart 下 `image`/`image[]` 可为**文件**或**base64 文本**（同名重复即数组），`mask` 同理。数组里有非字符串 → 400（不静默丢图） | `extractImageRefs`、`decodeImageRef`、`imageEdits` |
 | 生图响应形态 | **默认回 url**（不传 `response_format` / 传 `null`/`None` → `data[0].url`，不附 b64）；`response_format=b64_json` → 只回 b64 且**不落盘**；配置 `images.response_format=both` → 两者都给。落盘失败或无存储 → 回落 b64 + 头 `X-XHX-Image-URL: unavailable`，绝不回 `url:null` | `server.resolveResponseFormat`、`attachImageURLs` |

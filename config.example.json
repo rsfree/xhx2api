@@ -24,7 +24,7 @@
     "points_base": "",
     "origin": "",
     "timeout_seconds": 120,
-    "header_timeout_seconds": 120,
+    "header_timeout_seconds": 180,
     "idle_timeout_seconds": 300,
     "user_agent": "",
     "client_version": "",

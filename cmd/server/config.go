@@ -283,7 +283,9 @@ func defaults() *Config {
 		},
 	}
 	c.Upstream.TimeoutSeconds = 120
-	c.Upstream.HeaderTimeoutSeconds = 120
+	// 180 而不是 120：上游长上下文请求普遍很慢（2026-11-02 线上成功请求的
+	// 首字 p90 已到 284s），120s 的等响应头窗口会把本来能成的请求判成 504。
+	c.Upstream.HeaderTimeoutSeconds = 180
 	c.Upstream.IdleTimeoutSeconds = 300
 	c.Upstream.CatalogCacheFile = "./data/model_catalog.json"
 	c.Cooldown.PlanCredit = "12h"
