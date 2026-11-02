@@ -600,6 +600,16 @@ func (p *Pool) release(uid string, kind *ErrKind, message string, latency time.D
 		st.InFlight--
 	}
 	now := time.Now()
+	// client / none 不是账号的问题：客户端传错参数（400）或无法归类的错误，
+	// 只留 last_error 供排障，**整条不进账号统计**——不计 Total/Fail/FailCount、
+	// 不参与平均延迟、不触发降权。否则下游一个错参数就能把好号喂到
+	// DegradeThresh，账号页的成功率也失去意义（2026-11-02 线上：16 条
+	// temperature 400 给 5 个号各记了失败，成功率被拖到 21%-35%）。
+	if kind != nil && (*kind == "client" || *kind == "none") {
+		st.LastError = truncateText(message, 200)
+		p.markDirtyLocked()
+		return
+	}
 	st.Total++
 	// 滑动平均延迟（面板看趋势用；首次直接取样本）。
 	if latency > 0 {
