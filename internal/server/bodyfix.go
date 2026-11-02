@@ -155,34 +155,47 @@ func stripTemperature(body []byte) []byte {
 	return raw
 }
 
-// maxTokensRangeRe 从上游的参数校验报错里取「允许的最大输出额度」。
+// maxTokensRangeRe 从上游的参数校验报错里取「允许的输出额度区间」。
 //
 // 实测（2026-11-02 线上）：客户端传超范围值时上游回
-// HTTP 400 "Range of max_tokens should be [1, 131072]"。上限按模型/版本会变
+// HTTP 400 "Range of max_tokens should be [1, 131072]"。区间按模型/版本会变
 // （目录里的 max_output_tokens 是 100000，与校验上限并不一致），硬编码会在
 // 上游改限后失效，所以按报错原文取。
-var maxTokensRangeRe = regexp.MustCompile(`range of max_tokens should be \[\s*\d+\s*,\s*(\d+)\s*\]`)
+var maxTokensRangeRe = regexp.MustCompile(`range of max_tokens should be \[\s*(\d+)\s*,\s*(\d+)\s*\]`)
 
-// maxTokensLimitFromError 返回报错里的输出额度上限；不是这条报错就返回 0。
-func maxTokensLimitFromError(msg string) int {
+// maxTokensRangeFromError 返回报错里的额度区间；不是这条报错就返回 0, 0。
+func maxTokensRangeFromError(msg string) (lo, hi int) {
 	m := maxTokensRangeRe.FindStringSubmatch(strings.ToLower(msg))
-	if len(m) != 2 {
-		return 0
+	if len(m) != 3 {
+		return 0, 0
 	}
-	n, err := strconv.Atoi(m[1])
-	if err != nil || n <= 0 {
-		return 0
+	lo, err1 := strconv.Atoi(m[1])
+	hi, err2 := strconv.Atoi(m[2])
+	if err1 != nil || err2 != nil || hi <= 0 {
+		return 0, 0
 	}
-	return n
+	return lo, hi
 }
 
-// clampMaxTokens 把超上限的输出额度收到 limit。只收不抬，没超就原样返回。
+// clampMaxTokens 把输出额度收进 [lo, hi]。
+//
+// 两端都要收：线上两条 400 的原文都是这条报错，客户端填的可能是负数（当
+// 「不限」用）而不是超上限——只收上界的话它们会照样 400 透给客户端。
+// 低于下界时补到 defaultMinOutputTokens：给 1 个 token 对思考型模型等于
+// 只回空正文（见 liftMaxTokens 的实测）。
 //
 // changed=false 表示这条 body 里没有可修的字段，调用方不该重试（否则会拿
 // 同一份 body 再吃一次同样的 400）。
-func clampMaxTokens(body []byte, limit int) (out []byte, changed bool) {
-	if limit <= 0 {
+func clampMaxTokens(body []byte, lo, hi int) (out []byte, changed bool) {
+	if hi <= 0 && lo <= 0 {
 		return body, false
+	}
+	floor := lo
+	if floor < defaultMinOutputTokens {
+		floor = defaultMinOutputTokens
+	}
+	if hi > 0 && floor > hi {
+		floor = hi
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
@@ -190,11 +203,17 @@ func clampMaxTokens(body []byte, limit int) (out []byte, changed bool) {
 	}
 	for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
 		v, ok := obj[key].(float64)
-		if !ok || v <= float64(limit) {
+		if !ok {
 			continue
 		}
-		obj[key] = float64(limit)
-		changed = true
+		switch {
+		case hi > 0 && v > float64(hi):
+			obj[key] = float64(hi)
+			changed = true
+		case v < float64(floor):
+			obj[key] = float64(floor)
+			changed = true
+		}
 	}
 	if !changed {
 		return body, false

@@ -754,19 +754,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if cerr != nil {
 			kind := classifyErr(cerr, status, string(rawErr))
 			msg := cerr.Error()
-			// 输出额度超过上游上限：报错里给了 [1, N]，按 N 收一次再重试。
-			// 只收不发明额度，同号重试、不吃惩罚——这是客户端填大了，
-			// 不是账号有问题（2026-11-02 线上 2 条 400 就是这么来的）。
+			// 输出额度超出上游区间：报错里给了 [lo, hi]，收进区间再重试。
+			// 只收不发明额度，同号重试、不吃惩罚——这是客户端填大了或填了
+			// 负数（当「不限」用），不是账号有问题。
 			if kind == "client" && !clamped {
-				if limit := maxTokensLimitFromError(msg); limit > 0 {
-					if fixed, changed := clampMaxTokens(body, limit); changed {
+				if lo, hi := maxTokensRangeFromError(msg); hi > 0 {
+					if fixed, changed := clampMaxTokens(body, lo, hi); changed {
 						clamped = true
 						body = fixed
 						lease.ReleaseSuccess(latency)
 						if tr != nil {
 							tr.rotations++
 						}
-						log.Printf("INFO: [chat] uid=%s model=%s max_tokens 超上限，收到 %d 重试", a.UID, model, limit)
+						log.Printf("INFO: [chat] uid=%s model=%s max_tokens 超出 [%d,%d]，收进区间重试", a.UID, model, lo, hi)
 						continue
 					}
 				}

@@ -2488,10 +2488,11 @@ func TestChatDropsTemperature(t *testing.T) {
 	}
 }
 
-// TestChatClampsMaxTokensAndRetries 守「超上限按报错里的上界收一次再重试」。
+// TestChatClampsMaxTokensAndRetries 守「超出报文区间时收进区间再重试」。
 //
-// 线上原文：400 "Range of max_tokens should be [1, 131072]"。这条是客户端
-// 填大了，不该换号、不该罚号，也不该把 400 直接甩给客户端——收一次就能成。
+// 线上原文：400 "Range of max_tokens should be [1, 131072]"。客户端常把负数
+// 当「不限」传（这条 400 就来自这种写法）。这是客户端填错了，不该换号、不该
+// 罚号，也不该把 400 直接甩出去——收一次就能成。
 func TestChatClampsMaxTokensAndRetries(t *testing.T) {
 	var mu sync.Mutex
 	var bodies []map[string]any
@@ -2512,7 +2513,7 @@ func TestChatClampsMaxTokensAndRetries(t *testing.T) {
 	}, "1001")
 
 	resp := env.post(t, "/v1/chat/completions", map[string]any{
-		"model": "raccoon-8c4485", "max_tokens": 200000, "stream": true,
+		"model": "raccoon-8c4485", "max_tokens": -1, "stream": true,
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	})
 	if resp.StatusCode != 200 {
@@ -2526,8 +2527,8 @@ func TestChatClampsMaxTokensAndRetries(t *testing.T) {
 	mu.Lock()
 	second := bodies[1]
 	mu.Unlock()
-	if v, _ := second["max_tokens"].(float64); v != 131072 {
-		t.Fatalf("重试 body 的 max_tokens = %v, want 131072", second["max_tokens"])
+	if v, _ := second["max_tokens"].(float64); v != 2048 {
+		t.Fatalf("重试 body 的 max_tokens = %v, want 2048", second["max_tokens"])
 	}
 	for _, e := range env.pool.List() {
 		if e.Fail != 0 || e.FailCount != 0 {

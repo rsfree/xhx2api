@@ -165,43 +165,50 @@ func TestStripTemperature(t *testing.T) {
 	}
 }
 
-// TestMaxTokensLimitFromError 用的是线上原样报错（含前缀与 request_id）。
-func TestMaxTokensLimitFromError(t *testing.T) {
+// TestMaxTokensRangeFromError 用的是线上原样报错（含前缀与 request_id）。
+func TestMaxTokensRangeFromError(t *testing.T) {
 	cases := []struct {
-		msg  string
-		want int
+		msg    string
+		lo, hi int
 	}{
-		{"upstream client (http 400): Range of max_tokens should be [1, 131072] (type: invalid_request_error) (request_id: chatcmpl-5f568a)", 131072},
-		{"Range of max_tokens should be [1, 8192]", 8192},
-		{"range of max_tokens should be [ 1 , 4096 ]", 4096},
-		{"invalid temperature: only 1 is allowed for this model", 0},
-		{"", 0},
+		{"upstream client (http 400): Range of max_tokens should be [1, 131072] (type: invalid_request_error) (request_id: chatcmpl-5f568a)", 1, 131072},
+		{"Range of max_tokens should be [1, 8192]", 1, 8192},
+		{"range of max_tokens should be [ 2 , 4096 ]", 2, 4096},
+		{"invalid temperature: only 1 is allowed for this model", 0, 0},
+		{"", 0, 0},
 	}
 	for _, tc := range cases {
-		if got := maxTokensLimitFromError(tc.msg); got != tc.want {
-			t.Fatalf("%q → %d, want %d", tc.msg, got, tc.want)
+		lo, hi := maxTokensRangeFromError(tc.msg)
+		if lo != tc.lo || hi != tc.hi {
+			t.Fatalf("%q → [%d, %d], want [%d, %d]", tc.msg, lo, hi, tc.lo, tc.hi)
 		}
 	}
 }
 
-// TestClampMaxTokens 守「只收不抬、没超不动」。
+// TestClampMaxTokens 守「两端都收、区间内不动」。
+//
+// 负数/0 是客户端当「不限」用的写法，只收上界的话它们会照样 400；收到下限
+// 时补到 defaultMinOutputTokens（给 1 个 token 等于空正文）。
 func TestClampMaxTokens(t *testing.T) {
 	cases := []struct {
 		name    string
 		in      string
-		limit   int
+		lo, hi  int
 		want    string
 		changed bool
 	}{
-		{"超上限收到上限", `{"max_tokens":200000}`, 131072, "131072", true},
-		{"等于上限不动", `{"max_tokens":131072}`, 131072, "131072", false},
-		{"没超不动", `{"max_tokens":4096}`, 131072, "4096", false},
-		{"没字段不动", `{"messages":[]}`, 131072, "0", false},
-		{"max_output_tokens 也收", `{"max_output_tokens":200000}`, 131072, "131072", true},
+		{"超上限收到上限", `{"max_tokens":200000}`, 1, 131072, "131072", true},
+		{"负数补到下限", `{"max_tokens":-1}`, 1, 131072, "2048", true},
+		{"0 也补到下限", `{"max_tokens":0}`, 1, 131072, "2048", true},
+		{"等于上限不动", `{"max_tokens":131072}`, 1, 131072, "131072", false},
+		{"区间内不动", `{"max_tokens":4096}`, 1, 131072, "4096", false},
+		{"没字段不动", `{"messages":[]}`, 1, 131072, "0", false},
+		{"max_output_tokens 也收", `{"max_output_tokens":200000}`, 1, 131072, "131072", true},
+		{"上限比下限小时贴上限", `{"max_tokens":5000}`, 1, 1024, "1024", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out, changed := clampMaxTokens([]byte(tc.in), tc.limit)
+			out, changed := clampMaxTokens([]byte(tc.in), tc.lo, tc.hi)
 			if changed != tc.changed {
 				t.Fatalf("changed = %v, want %v", changed, tc.changed)
 			}
