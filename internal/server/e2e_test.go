@@ -2513,7 +2513,7 @@ func TestChatClampsMaxTokensAndRetries(t *testing.T) {
 	}, "1001")
 
 	resp := env.post(t, "/v1/chat/completions", map[string]any{
-		"model": "raccoon-8c4485", "max_tokens": -1, "stream": true,
+		"model": "raccoon-8c4485", "max_tokens": 200000, "stream": true,
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	})
 	if resp.StatusCode != 200 {
@@ -2527,8 +2527,8 @@ func TestChatClampsMaxTokensAndRetries(t *testing.T) {
 	mu.Lock()
 	second := bodies[1]
 	mu.Unlock()
-	if v, _ := second["max_tokens"].(float64); v != 2048 {
-		t.Fatalf("重试 body 的 max_tokens = %v, want 2048", second["max_tokens"])
+	if v, _ := second["max_tokens"].(float64); v != 131072 {
+		t.Fatalf("重试 body 的 max_tokens = %v, want 131072", second["max_tokens"])
 	}
 	for _, e := range env.pool.List() {
 		if e.Fail != 0 || e.FailCount != 0 {
@@ -2537,6 +2537,42 @@ func TestChatClampsMaxTokensAndRetries(t *testing.T) {
 		if e.CooldownUntil != 0 {
 			t.Fatalf("参数错不该冷却账号: %+v", e)
 		}
+	}
+}
+
+// TestChatLiftsNonPositiveMaxTokens 守「负数/0 在出站前就修掉」。
+//
+// 客户端常拿 -1 表示「不限」，上游直接 400（中文报范围、英文报 invalid or
+// missing——文案没有区间可解析，所以必须在发请求前就抬到下限）。
+func TestChatLiftsNonPositiveMaxTokens(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var obj map[string]any
+		_ = json.Unmarshal(raw, &obj)
+		mu.Lock()
+		got = obj
+		mu.Unlock()
+		sseChat("raccoon-8c4485", "ok")(w, r)
+	}, "1001")
+
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model": "raccoon-8c4485", "max_tokens": -1, "stream": true,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("HTTP %d", resp.StatusCode)
+	}
+	_ = readSSE(t, resp)
+	if n := env.chatHits.Load(); n != 1 {
+		t.Fatalf("不该重试（上游只该收到 1 次），实际 %d", n)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// Config.MinOutputTokens 在测试装置里没设，handler 用默认下限 2048。
+	if v, _ := got["max_tokens"].(float64); v != 2048 {
+		t.Fatalf("出站 max_tokens = %v, want 2048", got["max_tokens"])
 	}
 }
 

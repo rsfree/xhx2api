@@ -97,10 +97,15 @@ func raiseMaxTokens(body []byte, target int) []byte {
 	return out
 }
 
-// liftMaxTokens 把过小的输出额度抬到 floor。
+// liftMaxTokens 把不合法的输出额度抬到 floor。
 //
 // 三种协议的字段名都认：chat 的 max_tokens / max_completion_tokens、
 // responses 的 max_output_tokens（messages 入口在转换时已折成 max_tokens）。
+//
+// 负数/0 也算「不合法」：客户端常拿 -1 表示「不限」，但上游直接 HTTP 400
+// （2026-11-02 线上实测两种文案：中文「max_tokens参数非法：限制数值范围
+// [1,131072]」、英文「The request parameter max_tokens is invalid or
+// missing」）。按 0 个 token 理解更没意义，统一抬到 floor。
 func liftMaxTokens(body []byte, floor int) []byte {
 	if floor <= 0 {
 		return body
@@ -112,7 +117,7 @@ func liftMaxTokens(body []byte, floor int) []byte {
 	changed := false
 	for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
 		v, ok := obj[key].(float64)
-		if !ok || v <= 0 || v >= float64(floor) {
+		if !ok || v >= float64(floor) {
 			continue
 		}
 		obj[key] = float64(floor)
