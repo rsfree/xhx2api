@@ -699,6 +699,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// title 只走 Header（积分对账），body 里必须摘掉：上游对未知字段严格校验。
 	body = stripTurnTitle(body)
+	// temperature 一律不外发：上游对思考型模型只接受 1，客户端带的 0.7
+	// 会被直接 400（2026-11-02 线上 57% 的失败来自这一条）。
+	body = stripTemperature(body)
 	// 思考 token 算在 max_tokens 里，小额度会让正文回空——统一抬到下限。
 	body = liftMaxTokens(body, h.cfg.MinOutputTokens)
 	body = upstream.PrepareBody(body)
@@ -715,6 +718,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 	// escalated 表示已经为「思考吃光额度」加过一次额度，避免反复重试。
 	escalated := false
+	// clamped 表示已经为「max_tokens 超上限」收过一次，避免同一份 body 反复撞。
+	clamped := false
 	excluded := map[string]bool{}
 	for attempt := 0; attempt < h.cfg.MaxRotate; attempt++ {
 		if tr != nil {
@@ -749,6 +754,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if cerr != nil {
 			kind := classifyErr(cerr, status, string(rawErr))
 			msg := cerr.Error()
+			// 输出额度超过上游上限：报错里给了 [1, N]，按 N 收一次再重试。
+			// 只收不发明额度，同号重试、不吃惩罚——这是客户端填大了，
+			// 不是账号有问题（2026-11-02 线上 2 条 400 就是这么来的）。
+			if kind == "client" && !clamped {
+				if limit := maxTokensLimitFromError(msg); limit > 0 {
+					if fixed, changed := clampMaxTokens(body, limit); changed {
+						clamped = true
+						body = fixed
+						lease.ReleaseSuccess(latency)
+						if tr != nil {
+							tr.rotations++
+						}
+						log.Printf("INFO: [chat] uid=%s model=%s max_tokens 超上限，收到 %d 重试", a.UID, model, limit)
+						continue
+					}
+				}
+			}
 			// 登录态失效先试着续期，续上了就**不罚号**：401 往往只是 token 恰好
 			// 过期，账号本身完全正常。先罚 2 分钟冷却再去续期，会让这个号在
 			// 冷却窗口内不可用（实测踩过：单号部署直接 503）。

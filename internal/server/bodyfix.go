@@ -18,7 +18,12 @@
 // （上游客户端自己会报错，网关不该多一层改动）。
 package server
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"regexp"
+	"strconv"
+	"strings"
+)
 
 // defaultMinOutputTokens 是出站 max_tokens 的默认下限。
 //
@@ -121,4 +126,82 @@ func liftMaxTokens(body []byte, floor int) []byte {
 		return body
 	}
 	return raw
+}
+
+// stripTemperature 摘掉出站请求里的 temperature。
+//
+// 为什么（2026-11-02 线上实测）：上游对思考型模型（sn-kimi-k3）只接受
+// temperature=1，客户端带 0.7 这类默认值会被直接 HTTP 400
+// "invalid temperature: only 1 is allowed for this model"。当天 28 条失败里
+// 16 条是这个，而且下游把 400 当可重试，3 分钟连打 16 次、给 5 个号各记了
+// 一次失败。温度对思考型模型本来不生效，与其维护「哪些模型只认 1」的名单
+// （上游上新模型就会漏），不如一律不外发，让上游用自己的默认值。
+//
+// 代价：支持温度的普通模型（raccoon-*）也会退回上游默认温度。要恢复按模型
+// 区分时，把这里改成按 body 里的 model 前缀判断即可。
+func stripTemperature(body []byte) []byte {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	if _, ok := obj["temperature"]; !ok {
+		return body
+	}
+	delete(obj, "temperature")
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return raw
+}
+
+// maxTokensRangeRe 从上游的参数校验报错里取「允许的最大输出额度」。
+//
+// 实测（2026-11-02 线上）：客户端传超范围值时上游回
+// HTTP 400 "Range of max_tokens should be [1, 131072]"。上限按模型/版本会变
+// （目录里的 max_output_tokens 是 100000，与校验上限并不一致），硬编码会在
+// 上游改限后失效，所以按报错原文取。
+var maxTokensRangeRe = regexp.MustCompile(`range of max_tokens should be \[\s*\d+\s*,\s*(\d+)\s*\]`)
+
+// maxTokensLimitFromError 返回报错里的输出额度上限；不是这条报错就返回 0。
+func maxTokensLimitFromError(msg string) int {
+	m := maxTokensRangeRe.FindStringSubmatch(strings.ToLower(msg))
+	if len(m) != 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// clampMaxTokens 把超上限的输出额度收到 limit。只收不抬，没超就原样返回。
+//
+// changed=false 表示这条 body 里没有可修的字段，调用方不该重试（否则会拿
+// 同一份 body 再吃一次同样的 400）。
+func clampMaxTokens(body []byte, limit int) (out []byte, changed bool) {
+	if limit <= 0 {
+		return body, false
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body, false
+	}
+	for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+		v, ok := obj[key].(float64)
+		if !ok || v <= float64(limit) {
+			continue
+		}
+		obj[key] = float64(limit)
+		changed = true
+	}
+	if !changed {
+		return body, false
+	}
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		return body, false
+	}
+	return raw, true
 }

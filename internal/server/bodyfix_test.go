@@ -118,3 +118,106 @@ func TestRaiseMaxTokensOnlyRaises(t *testing.T) {
 		})
 	}
 }
+
+// TestStripTemperature 守「temperature 一律不外发」。
+//
+// 上游对 sn-kimi-k3 只接受 temperature=1，客户端带 0.7 直接 400；网关不做
+// 逐模型白名单，统一摘掉（2026-11-02 线上 57% 的失败来自这一条）。
+func TestStripTemperature(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool // 输出里是否还带 temperature
+	}{
+		{"0.7 摘掉", `{"model":"sn-kimi-k3","temperature":0.7}`, false},
+		{"0 也摘掉（不判断值）", `{"temperature":0}`, false},
+		{"1 也摘掉（统一形状）", `{"temperature":1}`, false},
+		{"没给就不动", `{"model":"m"}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := stripTemperature([]byte(tc.in))
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatalf("输出不是 JSON: %s", out)
+			}
+			if _, ok := got["temperature"]; ok != tc.want {
+				t.Fatalf("temperature 还在: %s", out)
+			}
+		})
+	}
+	// 其他字段不能丢：摘 temperature 不能把 messages/model 一起弄没。
+	in := `{"model":"m","temperature":0.7,"stream":true,"messages":[{"role":"user","content":"你好"}]}`
+	out := stripTemperature([]byte(in))
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["model"] != "m" || got["stream"] != true {
+		t.Fatalf("其他字段被改坏: %s", out)
+	}
+	if msgs, ok := got["messages"].([]any); !ok || len(msgs) != 1 {
+		t.Fatalf("messages 丢了: %s", out)
+	}
+	// 非法 JSON 原样返回，网关不该多一层改动。
+	if bad := "not json"; string(stripTemperature([]byte(bad))) != bad {
+		t.Fatal("非法 JSON 被改动了")
+	}
+}
+
+// TestMaxTokensLimitFromError 用的是线上原样报错（含前缀与 request_id）。
+func TestMaxTokensLimitFromError(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want int
+	}{
+		{"upstream client (http 400): Range of max_tokens should be [1, 131072] (type: invalid_request_error) (request_id: chatcmpl-5f568a)", 131072},
+		{"Range of max_tokens should be [1, 8192]", 8192},
+		{"range of max_tokens should be [ 1 , 4096 ]", 4096},
+		{"invalid temperature: only 1 is allowed for this model", 0},
+		{"", 0},
+	}
+	for _, tc := range cases {
+		if got := maxTokensLimitFromError(tc.msg); got != tc.want {
+			t.Fatalf("%q → %d, want %d", tc.msg, got, tc.want)
+		}
+	}
+}
+
+// TestClampMaxTokens 守「只收不抬、没超不动」。
+func TestClampMaxTokens(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		limit   int
+		want    string
+		changed bool
+	}{
+		{"超上限收到上限", `{"max_tokens":200000}`, 131072, "131072", true},
+		{"等于上限不动", `{"max_tokens":131072}`, 131072, "131072", false},
+		{"没超不动", `{"max_tokens":4096}`, 131072, "4096", false},
+		{"没字段不动", `{"messages":[]}`, 131072, "0", false},
+		{"max_output_tokens 也收", `{"max_output_tokens":200000}`, 131072, "131072", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, changed := clampMaxTokens([]byte(tc.in), tc.limit)
+			if changed != tc.changed {
+				t.Fatalf("changed = %v, want %v", changed, tc.changed)
+			}
+			var obj map[string]any
+			if err := json.Unmarshal(out, &obj); err != nil {
+				t.Fatalf("输出不是 JSON: %s", out)
+			}
+			var v float64
+			for _, k := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+				if f, ok := obj[k].(float64); ok {
+					v = f
+				}
+			}
+			if fmt.Sprint(v) != tc.want {
+				t.Fatalf("%s → %v, want %s", tc.in, v, tc.want)
+			}
+		})
+	}
+}

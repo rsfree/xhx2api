@@ -2451,3 +2451,121 @@ func TestMaskWithoutImageRejected(t *testing.T) {
 		t.Fatalf("提示应点名 mask: %s", body)
 	}
 }
+
+// TestChatDropsTemperature 守「temperature 一律不外发」。
+//
+// 上游对 sn-kimi-k3 只接受 temperature=1，客户端带 0.7 会被 400；网关在
+// bodyfix 里统一摘掉，上游收到的 body 不该再有这个字段（2026-11-02 线上
+// 57% 的失败就是它）。
+func TestChatDropsTemperature(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]any
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var obj map[string]any
+		_ = json.Unmarshal(raw, &obj)
+		mu.Lock()
+		got = obj
+		mu.Unlock()
+		sseChat("raccoon-8c4485", "ok")(w, r)
+	}, "1001")
+
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model": "raccoon-8c4485", "temperature": 0.7, "stream": true,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("HTTP %d", resp.StatusCode)
+	}
+	_ = readSSE(t, resp)
+	mu.Lock()
+	defer mu.Unlock()
+	if _, ok := got["temperature"]; ok {
+		t.Fatalf("出站 body 仍带 temperature: %v", got)
+	}
+	if got["model"] != "raccoon-8c4485" {
+		t.Fatalf("其他字段被改坏: %v", got)
+	}
+}
+
+// TestChatClampsMaxTokensAndRetries 守「超上限按报错里的上界收一次再重试」。
+//
+// 线上原文：400 "Range of max_tokens should be [1, 131072]"。这条是客户端
+// 填大了，不该换号、不该罚号，也不该把 400 直接甩给客户端——收一次就能成。
+func TestChatClampsMaxTokensAndRetries(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []map[string]any
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var obj map[string]any
+		_ = json.Unmarshal(raw, &obj)
+		mu.Lock()
+		bodies = append(bodies, obj)
+		first := len(bodies) == 1
+		mu.Unlock()
+		if first {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Range of max_tokens should be [1, 131072]","type":"invalid_request_error"}}`))
+			return
+		}
+		sseChat("raccoon-8c4485", "ok")(w, r)
+	}, "1001")
+
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model": "raccoon-8c4485", "max_tokens": 200000, "stream": true,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if resp.StatusCode != 200 {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("收额度后应当成功，HTTP %d: %s", resp.StatusCode, raw)
+	}
+	_ = readSSE(t, resp)
+	if n := env.chatHits.Load(); n != 2 {
+		t.Fatalf("应重试一次（上游命中 2 次），实际 %d", n)
+	}
+	mu.Lock()
+	second := bodies[1]
+	mu.Unlock()
+	if v, _ := second["max_tokens"].(float64); v != 131072 {
+		t.Fatalf("重试 body 的 max_tokens = %v, want 131072", second["max_tokens"])
+	}
+	for _, e := range env.pool.List() {
+		if e.Fail != 0 || e.FailCount != 0 {
+			t.Fatalf("参数错不该记到账号头上: fail=%d fail_count=%d", e.Fail, e.FailCount)
+		}
+		if e.CooldownUntil != 0 {
+			t.Fatalf("参数错不该冷却账号: %+v", e)
+		}
+	}
+}
+
+// TestClientErrorNotCountedAgainstAccount 守账号口径：client/none 不进账号统计。
+//
+// 否则下游传错一次参数，账号页成功率就掉一截，连着几次还会触发降权
+// （DegradeThresh），把本身健康的号排到后面。
+func TestClientErrorNotCountedAgainstAccount(t *testing.T) {
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid temperature: only 1 is allowed for this model"}}`))
+	}, "1001")
+
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model":    "raccoon-8c4485",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if resp.StatusCode != 400 {
+		t.Fatalf("HTTP %d", resp.StatusCode)
+	}
+	_ = readJSON(t, resp)
+	list := env.pool.List()
+	if len(list) != 1 {
+		t.Fatalf("账号数 = %d", len(list))
+	}
+	e := list[0]
+	if e.Total != 0 || e.Fail != 0 || e.FailCount != 0 || e.Success != 0 {
+		t.Fatalf("client 错误污染了账号统计: total=%d success=%d fail=%d fc=%d", e.Total, e.Success, e.Fail, e.FailCount)
+	}
+	if e.LastError == "" {
+		t.Fatal("last_error 应保留（排障用）")
+	}
+}
