@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/rsfree/xhx2api/internal/auth"
+	"github.com/rsfree/xhx2api/internal/reqlog"
 	"github.com/rsfree/xhx2api/internal/upstream"
 )
 
@@ -251,5 +252,20 @@ func TestPanelHasFavicon(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `rel="icon"`) {
 		t.Fatal("index.html 缺少 favicon，浏览器会自动请求 /favicon.ico 并得到 404")
+	}
+}
+
+// TestRequestsSummaryIncludesUnmetered 守「新增指标不能漏进 overview」。
+//
+// 2026-11-21 真踩过：reqlog 加了 usage_missing/unmetered，面板 overview 的
+// payload 是手写 map，没带 unmetered —— 前端「N 条未记账」永远不显示，
+// 看起来像这个池子特别省 token。
+func TestRequestsSummaryIncludesUnmetered(t *testing.T) {
+	got := requestsSummary(reqlog.Metrics{Total: 3, TokensTotal: 120, Unmetered: 2})
+	if got["unmetered"] != int64(2) {
+		t.Fatalf("unmetered = %v，期望 2", got["unmetered"])
+	}
+	if got["tokens_total"] != int64(120) || got["total"] != int64(3) {
+		t.Fatalf("其它指标被改坏了: %+v", got)
 	}
 }

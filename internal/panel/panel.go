@@ -302,15 +302,25 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		payload["session"] = p.cfg.SessionStats()
 	}
 	if p.cfg.RequestLog != nil {
-		m := p.cfg.RequestLog.Metrics()
-		payload["requests"] = map[string]any{
-			"total": m.Total, "success": m.Success, "failure": m.Failure,
-			"in_flight": m.InFlight, "rpm": m.RPM, "tokens_total": m.TokensTotal,
-			"latency_p50_ms": m.LatencyP50, "latency_p95_ms": m.LatencyP95,
-			"latency_avg_ms": m.LatencyAvg,
-		}
+		payload["requests"] = requestsSummary(p.cfg.RequestLog.Metrics())
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+// requestsSummary 是面板「请求」页顶部的指标快照。
+//
+// 抽成函数而不是在 payload 里手写 map：新增指标（比如 unmetered）漏一行，
+// 面板上就是「数据显示不出来」——2026-11-21 真踩过：reqlog 已经加了
+// usage_missing，这里没加 unmetered，「N 条未记账」永远不显示。
+func requestsSummary(m reqlog.Metrics) map[string]any {
+	return map[string]any{
+		"total": m.Total, "success": m.Success, "failure": m.Failure,
+		"in_flight": m.InFlight, "rpm": m.RPM, "tokens_total": m.TokensTotal,
+		"latency_p50_ms": m.LatencyP50, "latency_p95_ms": m.LatencyP95,
+		"latency_avg_ms": m.LatencyAvg,
+		// 上游没回 usage 的条数：Token 总量偏低时要能解释成「没记账」而不是「省」。
+		"unmetered": m.Unmetered,
+	}
 }
 
 // ---------------------------------------------------------------------------
