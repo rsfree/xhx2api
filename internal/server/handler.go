@@ -83,8 +83,8 @@ type Config struct {
 	// DisableImages 关掉 /v1/images/generations（零值 = 开启）。
 	// 用「禁用」而不是「启用」，理由同 ExcludeUpstreamHidden：零值要是正确行为。
 	DisableImages bool
-	// ImageModel 指定上游图片模型（空 = 上游默认组 raccoon-image-gen）。
-	ImageModel string
+	// 这里没有「上游图片模型」：上游一条生图通道只有一个模型组，model 被忽略，
+	// 生图能力只由 /v1/images/* 这个端点决定（客户端的 model 仅用于日志归因）。
 	// ImageReturnURL 表示 url 能力是否可用（配置里 return_url 默认开）。
 	// 关掉时显式要 response_format=url 会 400，默认形态回落 b64_json。
 	ImageReturnURL bool

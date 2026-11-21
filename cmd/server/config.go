@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -181,13 +182,14 @@ type Config struct {
 	} `json:"login"`
 
 	// Images 是生图通道（/v1/images/generations）。
+	//
+	// 这里**没有**「上游图片模型」这一项：上游一条生图通道只有一个模型组，
+	// model 字段被它完全忽略（2026-10-26 真号实测：gpt-image-2 / 捏造名都 200，
+	// image_tokens 一模一样）。所以路由只由端点决定，客户端的 model 只是标签。
+	// 老配置里留着 `images.model` 的不会报错：它进了下面那张废弃表。
 	Images struct {
 		// Enabled 默认 true；显式 false 关掉整条通道。
 		Enabled *bool `json:"enabled"`
-		// Model 指定上游图片模型（空 = 上游默认组 raccoon-image-gen）。
-		// 实测 fallback 组里有 raccoon-4eb26a / raccoon-0c119c / raccoon-ecc5fd，
-		// 但只有默认组是稳定入口，除非你确知要哪一个，否则留空。
-		Model string `json:"model"`
 		// TimeoutSeconds 单张图超时（默认 600）。
 		// 实测 1024 档 49-143s、4K 档 150s，但超限尺寸被压缩后单次能到 267s
 		// （2026-10-26 线上全形态验收），300s 的余量只剩 33 秒，故放到 600。
@@ -369,6 +371,93 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// deprecatedKey 是一个已从配置结构体里删掉、但老配置里可能还留着的键。
+type deprecatedKey struct {
+	// Path 是嵌套路径，如 {"images", "model"}。
+	Path []string
+	// Why 说明「为什么它没用了」，会打在日志里——用户看到自己填的键被忽略，
+	// 得知道是上游不认，而不是网关把他的配置吃了。
+	Why string
+}
+
+// deprecatedConfigKeys 是「已经不存在、解析时必须容忍」的配置项。
+//
+// 存在的理由只有一个：ParseConfig 用 DisallowUnknownFields（写错键名必须报错），
+// 而删掉一个结构体字段会让所有还写着它的老配置启动即失败。在这里静默摘掉，
+// 日志里说一句；saveConfig 还会顺手把它从磁盘上抹掉，不留「填了没用」的残渣。
+var deprecatedConfigKeys = []deprecatedKey{
+	{
+		Path: []string{"images", "model"},
+		Why:  "上游生图只有一条通道、model 字段被完全忽略；生图按端点路由，客户端填的 model 只是标签",
+	},
+}
+
+// deprecatedKeyReason 返回某个键被废弃的原因（日志用）。
+func deprecatedKeyReason(key string) string {
+	for _, d := range deprecatedConfigKeys {
+		if strings.Join(d.Path, ".") == key {
+			return d.Why
+		}
+	}
+	return ""
+}
+
+// stripDeprecatedKeys 从原始 JSON 里摘掉废弃键，返回新字节与被摘掉的路径。
+//
+// 解析失败就原样返回：这里不该替严格解析吞掉「整份 JSON 坏了」这种错。
+func stripDeprecatedKeys(raw []byte) ([]byte, []string) {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return raw, nil
+	}
+	var dropped []string
+	for _, d := range deprecatedConfigKeys {
+		if dropPath(probe, d.Path) {
+			dropped = append(dropped, strings.Join(d.Path, "."))
+		}
+	}
+	if len(dropped) == 0 {
+		return raw, nil
+	}
+	out, err := json.Marshal(probe)
+	if err != nil {
+		return raw, nil
+	}
+	return out, dropped
+}
+
+// dropPath 从 obj 里按 path 删除一个键，返回是否真的删掉了。
+//
+// 中间层删完要重新序列化回父层——否则删除只发生在临时 map 上，等于没删。
+// 中间层不是对象（用户把类型写错）时返回 false，让严格解析去报那个真正的错。
+func dropPath(obj map[string]json.RawMessage, path []string) bool {
+	if len(path) == 0 {
+		return false
+	}
+	if len(path) == 1 {
+		if _, ok := obj[path[0]]; !ok {
+			return false
+		}
+		delete(obj, path[0])
+		return true
+	}
+	raw, ok := obj[path[0]]
+	if !ok {
+		return false
+	}
+	var child map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &child); err != nil {
+		return false
+	}
+	if !dropPath(child, path[1:]) {
+		return false
+	}
+	if b, err := json.Marshal(child); err == nil {
+		obj[path[0]] = b
+	}
+	return true
+}
+
 // ParseConfig 解析原始字节（JSONC）。
 func ParseConfig(raw []byte) (*Config, error) {
 	stripped := stripJSONC(raw)
@@ -385,6 +474,12 @@ func ParseConfig(raw []byte) (*Config, error) {
 	clean, err := json.Marshal(probe)
 	if err != nil {
 		return nil, err
+	}
+	// 废弃键必须在严格解析**之前**摘掉：DisallowUnknownFields 会把它们判成
+	// 「配置项错误」，让带着旧文档升级的实例直接起不来。
+	clean, dropped := stripDeprecatedKeys(clean)
+	for _, key := range dropped {
+		log.Printf("WARN: 配置项 %s 已废弃，已忽略（%s）", key, deprecatedKeyReason(key))
 	}
 	cfg := defaults()
 	dec := json.NewDecoder(bytes.NewReader(clean))
@@ -797,6 +892,14 @@ func saveConfig(path string, raw []byte, replace bool) (*Config, []string, error
 	if err != nil {
 		return nil, nil, err
 	}
+	// 表单早就不再提交这个键，但合并语义会把它从旧文件里原样带回来。
+	// 不在这里抹掉，「删掉死配置」对老实例永远不生效。
+	if cleaned, dropped := stripDeprecatedKeys(mergedRaw); len(dropped) > 0 {
+		mergedRaw = cleaned
+		for _, key := range dropped {
+			log.Printf("WARN: 配置项 %s 已废弃，保存时已移除", key)
+		}
+	}
 	cfg, err := parseConfigLenient(mergedRaw)
 	if err != nil {
 		return nil, nil, err
@@ -805,7 +908,8 @@ func saveConfig(path string, raw []byte, replace bool) (*Config, []string, error
 	// 只列出「本次真的改了」的需重启字段：恒返回全量清单会让用户每次保存都
 	// 看到一串提示，久了就无视它，真正需要重启时反而错过。
 	oldCfg, _ := parseConfigLenient(oldRaw)
-	out, err := json.MarshalIndent(merged, "", "  ")
+	// 用摘过废弃键的字节写盘：merged 里可能还留着它，直接序列化会写回去。
+	out, err := json.MarshalIndent(json.RawMessage(mergedRaw), "", "  ")
 	if err != nil {
 		return nil, nil, err
 	}

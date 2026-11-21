@@ -256,7 +256,6 @@ func main() {
 		MinOutputTokens:       cfg.Server.MinOutputTokens,
 		ExcludeUpstreamHidden: cfg.Models.IncludeUpstreamHidden != nil && !*cfg.Models.IncludeUpstreamHidden,
 		DisableImages:         cfg.Images.Enabled != nil && !*cfg.Images.Enabled,
-		ImageModel:            cfg.Images.Model,
 		ImageTimeout:          time.Duration(cfg.Images.TimeoutSeconds) * time.Second,
 		ImageReturnURL:        cfg.ImageURLEnabled(),
 		ImageDefaultFormat:    cfg.ImageDefaultFormat(),

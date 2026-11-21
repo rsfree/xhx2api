@@ -1036,7 +1036,8 @@
         // 否则用户什么都没改、一保存就把生图关掉了（undefined 当 false 是最常见的坑）。
         { path: "images.enabled", label: "开启生图通道", type: "bool", defaultTrue: true, restart: true, hint: "默认开；关掉后 /v1/images/generations 直接拒绝" },
         { path: "images.timeout_seconds", label: "单张超时（秒）", type: "number", restart: true, hint: "实测 49-267s（267s 是 4096x4096 压到 2880 那次），默认 600" },
-        { path: "images.model", label: "上游图片模型", hint: "空 = 默认组 raccoon-image-gen（实测上游忽略这个字段）" },
+        // 没有「上游图片模型」：上游一条通道只有一个模型组、model 被忽略，
+        // 生图只按端点路由（客户端填什么都出同一张模型的图，见 /v1/models 的别名）。
         {
           path: "images.aliases", label: "图片模型别名", type: "lines", wide: true, omitIfEmpty: true,
           hint: "一行一个，默认 gpt-image-1 / gpt-image-1-mini / gpt-image-2 / gpt-image-2.5 / dall-e-2 / dall-e-3。"

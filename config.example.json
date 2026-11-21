@@ -103,7 +103,6 @@
   },
   "images": {
     "enabled": true,
-    "model": "",
     "timeout_seconds": 600,
     "response_format": "url",
     "return_url": true,

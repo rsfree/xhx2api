@@ -278,7 +278,6 @@ wire_api = "responses"
 | `session_sticky.prefix_affinity` | `false` | 没有会话 id 时也按消息前缀粘性。打开后同一 system 的**全部**请求会钉在一个号上（多号池退化），只在需要压低风控特征时开 |
 | `prompt.mode` | `passthrough` | `custom` 时用 `prompt.file` 替换 system |
 | `images.enabled` | `true` | 是否开放 `/v1/images/generations`（改了要重启） |
-| `images.model` | 空 | 指定上游图片模型；空 = 上游默认组 `raccoon-image-gen`。**实测上游忽略这个字段** |
 | `images.aliases` | `gpt-image-1/1-mini/2/2.5`、`dall-e-2/3` | 额外接受并暴露的图片模型名（热改生效）。上游只有一条生图通道，别名不改实际模型，纯粹方便客户端选中；`[]` = 全关 |
 | `images.timeout_seconds` | `600` | 单张图超时。实测 1024 档 49-143s、4K 档 150s，但超限尺寸压缩后单次能到 **267s**（300s 只剩 33 秒余量），故 600 |
 | `images.response_format` | `url` | 客户端**没传** `response_format`（或传 `null` / `None`）时的默认形态：`url` 只回链接、`b64_json` 只回 base64、`both` 两个都给。改了要重启 |
@@ -507,7 +506,8 @@ curl -s ... -d '{"prompt":"...","response_format":"b64_json"}' \
 
 ### 图片模型别名
 
-既然上游忽略 `model`，网关把常见名字做成了**别名**（默认全开）：
+别名只解决「客户端能不能选中」，不参与路由：只要请求打到 image 端点，`model`
+填什么都会出图。默认全开的常见名字：
 
 ```
 gpt-image-1  gpt-image-1-mini  gpt-image-2  gpt-image-2.5  dall-e-2  dall-e-3
@@ -521,9 +521,12 @@ gpt-image-1  gpt-image-1-mini  gpt-image-2  gpt-image-2.5  dall-e-2  dall-e-3
 
 三个刻意的设计：
 
-- **不转发客户端的 `model`**：改名和透传都没有意义（上游根本不读），而且传
-  `dall-e-3` 这类名字曾让 LiteLLM 报 `No fallback model group found`。想指定具体
-  图片模型用 `images.model`。
+- **按端点路由，`model` 随便填**：`/v1/images/generations` 与 `/v1/images/edits`
+  进来的请求一律当生图，网关**不做模型名校验**——空串、别名、对话模型名、随手编的
+  名字都出图（上游只有一条通道，`model` 它根本不读）。所以也没有「上游图片模型」
+  这个配置项：没有第二个模型可选。客户端的 `model` 只用于日志归因，**不转发给上游**
+  （透传 `dall-e-3` 这类名字曾让 LiteLLM 报 `No fallback model group found`）。
+  老配置里留着的 `images.model` 会被忽略并在下次保存时移除。
 - **默认返回 url，而不是 base64**：上游只回 base64（一张 4K 图 8MB+），所以网关
   自己把图落盘/传对象存储并提供 `/v1/images/<id>`。**不传 `response_format`
   （或传 `null` / `None`）就回 `url`**，且不再附 `b64_json`；要 base64 就显式传

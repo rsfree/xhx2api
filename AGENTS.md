@@ -22,6 +22,11 @@ tag 与 `latest`（默认分支）。
   远高于漏判（见 `TestClassifyDoesNotBlameAccountForParams`）；
 - 错误分类只在 `upstream.Classify` 与 `classifyErrorText` 两处，别在 handler 里
   另写一份文案匹配；
+- **删配置项不能只删结构体字段**：`ParseConfig` 是 `DisallowUnknownFields`，老配置
+  带着已删的键会在启动时直接报「配置项错误」——升级即停机。删字段的同一次改动里
+  还要：登进 `cmd/server/config.go` 的 `deprecatedConfigKeys`（严格解析前摘掉、
+  保存时从磁盘抹掉）、补一条「老配置能解析 + 未知键仍报错」的测试
+  （见 `TestParseConfigAcceptsDeprecatedImagesModel`）；
 - 配置/凭证/池状态的落盘统一是「写 `.tmp` → rename」：**配置只能目录挂载**
   （`./conf:/app/conf` + `-config /app/conf/config.json`）。挂成单文件
   `./config.json:/app/config.json` 时，`rename` 的目标是 bind mount 的 mountpoint，
@@ -113,7 +118,7 @@ tag 与 `latest`（默认分支）。
 | image 字段形态 | 三种都收：单张字符串 / 字符串数组 / `null`（= 无图）；元素可为 data URI 或**裸 base64**（含 URL-safe、缺 padding）。`/v1/images/edits` 收 multipart 与 JSON；multipart 下 `image`/`image[]` 可为**文件**或**base64 文本**（同名重复即数组），`mask` 同理。数组里有非字符串 → 400（不静默丢图） | `extractImageRefs`、`decodeImageRef`、`imageEdits` |
 | 生图响应形态 | **默认回 url**（不传 `response_format` / 传 `null`/`None` → `data[0].url`，不附 b64）；`response_format=b64_json` → 只回 b64 且**不落盘**；配置 `images.response_format=both` → 两者都给。落盘失败或无存储 → 回落 b64 + 头 `X-XHX-Image-URL: unavailable`，绝不回 `url:null` | `server.resolveResponseFormat`、`attachImageURLs` |
 | 图片落盘与回收 | 内容寻址 `<sha256前16字节>.<ext>`，`GET /v1/images/<name>` 免鉴权、`immutable` 缓存；超过 `images.max_total_mb`（默认 2048，0=不限）按 mtime 删最旧到 90%，**只删 `imageNameOK` 认得的文件**，节流 1 分钟 | `sweepImageDir` |
-| 生图 `model` 字段 | **完全被忽略**（2026-10-26 实测）：`gpt-image-2`、`gpt-image-2.5`、捏造名全 200，1024x1024 的 `image_tokens` 都是 196；响应体不回 `model`。别指望它切模型 | `upstream.ImageAliases` 注释 |
+| 生图 `model` 字段 | **完全被忽略**（2026-10-26 实测）：`gpt-image-2`、`gpt-image-2.5`、捏造名全 200，1024x1024 的 `image_tokens` 都是 196；响应体不回 `model`。别指望它切模型，也**别加模型名校验**：按端点路由，空串/别名/对话模型名/随手编的名字都出图（`TestImageEndpointIgnoresModelName`）。`images.model` 配置已删除——上游没有第二个模型可选；老配置里的键由 `deprecatedConfigKeys` 忽略并在保存时抹掉 | `upstream.ImageAliases` 注释、`cmd/server/config.go` |
 | 生图 size | **两条约束**：①最长边 ≤ 3840（超了先跑 106s 再 400）；②总像素 ≤ 8,294,400 = 3840×2160（超了**不报错**，静默降级：3840x3840 → 2880x2880）。实测 `1024x1024`→196 tokens、`1536x1024`→158、`1792x1024`→139、`3840x2160`(4K)→371 | `upstream.ClampImageSize` 提前按两条约束等比压，响应头 `X-XHX-Image-Size` |
 | 4K + quality | `3840x2160&quality=high` → 13342 image_tokens（默认档 371，36 倍）、136s、1806KB；quality 对耗时几乎无影响 | 同上 |
 | 生图默认值 | `size` 省略 → 上游给 **1254x1254**（229 tokens）；`size=auto` → **1024x1024**（196）——两者不一样。`quality` 省略恒为 `low` | `probe_4k.py ""` / `size=auto` |

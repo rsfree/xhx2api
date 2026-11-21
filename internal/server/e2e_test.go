@@ -50,6 +50,7 @@ type testEnv struct {
 	editCType     string
 	editPrompt    string
 	editHasFile   bool
+	editHasModel  bool
 	editFileCount int
 }
 
@@ -125,6 +126,7 @@ func setupEnv(t *testing.T, fakeHandler http.HandlerFunc, uids ...string) *testE
 		env.editHasFile = ferr == nil
 		env.editFileCount = len(r.MultipartForm.File["image"])
 		env.editPrompt = r.FormValue("prompt")
+		_, env.editHasModel = r.MultipartForm.Value["model"]
 		env.imageMu.Unlock()
 		if ferr != nil {
 			writeJSON(w, 400, map[string]any{"error": map[string]any{"code": "400", "message": "missing image"}})
@@ -2604,5 +2606,64 @@ func TestClientErrorNotCountedAgainstAccount(t *testing.T) {
 	}
 	if e.LastError == "" {
 		t.Fatal("last_error 应保留（排障用）")
+	}
+}
+
+// TestImageEndpointIgnoresModelName 守「按端点路由，model 随便填」。
+//
+// 上游 /images/gen 完全忽略 model（2026-10-26 真号实测：gpt-image-2、gpt-image-2.5
+// 和捏造名都 200，image_tokens 一模一样），所以网关也不做任何模型名校验：只要请求
+// 进了 /v1/images/* 就当生图。空串、别名、对话模型名、随手编的名字必须走同一条通道；
+// 同时 model 不能转发给上游——透传 dall-e-3 这类名字曾让 LiteLLM 报
+// "No fallback model group found"，等于白扣一次额度。
+func TestImageEndpointIgnoresModelName(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	for _, model := range []string{"", "gpt-image-1", "dall-e-3", "raccoon-8c4485", "totally-made-up-xyz", "GPT-Image-2.5"} {
+		body := map[string]any{"prompt": "一只戴帽子的橘猫", "size": "1024x1024"}
+		if model != "" {
+			body["model"] = model
+		}
+		resp, raw := postImage(t, env.gateway.URL, body)
+		if resp.StatusCode != 200 {
+			t.Fatalf("model=%q 应当出图，得到 HTTP %d: %s", model, resp.StatusCode, raw)
+		}
+		env.imageMu.Lock()
+		sent := append([]byte(nil), env.imageBody...)
+		env.imageMu.Unlock()
+		var payload map[string]any
+		if err := json.Unmarshal(sent, &payload); err != nil {
+			t.Fatalf("model=%q 时上游收到的不是 JSON: %v (%s)", model, err, sent)
+		}
+		if _, ok := payload["model"]; ok {
+			t.Fatalf("model=%q 被转发给上游了: %s", model, sent)
+		}
+	}
+}
+
+// TestImageEditsIgnoresModelName 是同一口径的改图面：multipart 里的 model 同样只是
+// 标签，既不校验也不转发（上游 edits 也不读它）。
+func TestImageEditsIgnoresModelName(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("prompt", "把背景换成雪山")
+	_ = mw.WriteField("model", "some-unknown-image-model")
+	_ = mw.WriteField("image", pngB64("one"))
+	_ = mw.Close()
+
+	resp, err := http.Post(env.gateway.URL+"/v1/images/edits", mw.FormDataContentType(), &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("任意 model 名都该改图成功，得到 %d: %s", resp.StatusCode, body)
+	}
+	if env.editFileCount != 1 {
+		t.Fatalf("应当转成 1 个文件发给上游，实际 %d", env.editFileCount)
+	}
+	if env.editHasModel {
+		t.Fatal("model 不该出现在发给上游的 multipart 里")
 	}
 }

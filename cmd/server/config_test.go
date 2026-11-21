@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -362,5 +363,77 @@ func TestImageRestartFields(t *testing.T) {
 		if !got[want] {
 			t.Fatalf("改 %s 应当提示重启，实际 %v", want, got)
 		}
+	}
+}
+
+// TestParseConfigAcceptsDeprecatedImagesModel 守「删掉的键不会把老实例拦在启动前」。
+//
+// images.model 从来没被读过（上游生图只有一条通道、model 被完全忽略），删掉它是
+// 清死配置；但 ParseConfig 是严格解析（DisallowUnknownFields），删字段还让老配置
+// 报「配置项错误」，就等于升级即停机。所以这个键要在严格解析之前被摘掉，且同段的
+// 其它键照旧生效。
+func TestParseConfigAcceptsDeprecatedImagesModel(t *testing.T) {
+	cfg, err := ParseConfig([]byte(`{"api_key":"sk-x","images":{"enabled":true,"model":"raccoon-4eb26a","timeout_seconds":321}}`))
+	if err != nil {
+		t.Fatalf("老配置里的 images.model 不该报错: %v", err)
+	}
+	if cfg.Images.TimeoutSeconds != 321 {
+		t.Fatalf("同段其它键应当照常解析，timeout_seconds = %d", cfg.Images.TimeoutSeconds)
+	}
+	if cfg.Images.Enabled == nil || !*cfg.Images.Enabled {
+		t.Fatalf("enabled 丢了: %+v", cfg.Images.Enabled)
+	}
+}
+
+// TestParseConfigKeepsRejectingUnknownKeys 是上面那条的对照：摘废弃键不能把严格
+// 校验一起放开——写错键名（modle）仍然要报错并点出键名。
+func TestParseConfigKeepsRejectingUnknownKeys(t *testing.T) {
+	_, err := ParseConfig([]byte(`{"images":{"enabled":true,"modle":"x"}}`))
+	if err == nil || !strings.Contains(err.Error(), "modle") {
+		t.Fatalf("未知键仍应报错并点出键名: %v", err)
+	}
+}
+
+// TestParseConfigDeprecatedKeyWrongParentType：images 写成字符串是真正的配置错误，
+// 不能被「摘废弃键」顺手吞掉。
+func TestParseConfigDeprecatedKeyWrongParentType(t *testing.T) {
+	if _, err := ParseConfig([]byte(`{"images":"oops"}`)); err == nil {
+		t.Fatal("images 不是对象时应当报错")
+	}
+}
+
+// TestSaveConfigDropsDeprecatedImagesModel：面板保存一次就把死键从磁盘上抹掉。
+//
+// 合并语义（SaveConfig）会从旧文件里把它原样带回来，不显式摘掉的话「删掉死配置」
+// 对老实例永远不生效：表单早就不提交它了，文件里却一直留着。
+func TestSaveConfigDropsDeprecatedImagesModel(t *testing.T) {
+	path := t.TempDir() + "/config.json"
+	old := `{"api_key":"sk-old","images":{"enabled":true,"model":"raccoon-4eb26a","timeout_seconds":600}}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := SaveConfig(path, []byte(`{"images":{"timeout_seconds":600}}`)); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	images, _ := got["images"].(map[string]any)
+	if images == nil {
+		t.Fatalf("images 段丢了:\n%s", raw)
+	}
+	if _, ok := images["model"]; ok {
+		t.Fatalf("废弃键应当从磁盘上抹掉:\n%s", raw)
+	}
+	if _, ok := images["enabled"]; !ok {
+		t.Fatalf("同段其它键被洗掉了（合并语义不能吃掉整段）:\n%s", raw)
+	}
+	if got["api_key"] == nil {
+		t.Fatalf("api_key 丢了:\n%s", raw)
 	}
 }
