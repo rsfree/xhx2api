@@ -422,7 +422,10 @@
       { label: "在途请求", value: c.in_flight || 0, foot: `RPM ${r.rpm ? r.rpm.toFixed(1) : "-"}`, cls: "accent" },
       { label: "请求总数", value: fmtNum(r.total || 0), foot: `失败 ${fmtNum(r.failure || 0)}` },
       { label: "成功率", value: successRate, foot: `P50 ${fmtDur(r.latency_p50_ms)} · P95 ${fmtDur(r.latency_p95_ms)}`, cls: "ok" },
-      { label: "Token 总量", value: fmtNum(r.tokens_total || 0), foot: "输入 + 输出" },
+      // Token 总量只统计上游给了 usage 的请求；未记账的条数必须一起露出来，
+      // 否则「上游没回 usage」会被读成「这个池子特别省 token」。
+      { label: "Token 总量", value: fmtNum(r.tokens_total || 0),
+        foot: r.unmetered ? `输入 + 输出 · ${fmtNum(r.unmetered)} 条未记账` : "输入 + 输出" },
       { label: "运行时长", value: fmtDur((o.uptime_s || 0) * 1000), foot: "自进程启动" },
     ];
     $("#cards").innerHTML = cards.map((card) => `
@@ -1238,7 +1241,11 @@
     tbody.innerHTML = events.map((e) => {
       const statusCls = e.status >= 400 || e.error_kind ? "bad" : "ok";
       const proto = { chat: "OpenAI", messages: "Anthropic", responses: "Responses", images: "生图" }[e.protocol] || e.protocol || "-";
-      const tokens = e.total_tokens || e.total || 0;
+      // 上游没回 usage 时三个 token 都是 0，但那是「没记账」不是「没消耗」。
+      // 显示 0 会被读成后者，还会把总量和均值一起拉低，所以单独标成 ?。
+      const tokens = e.usage_missing
+        ? `<span class="muted" title="上游未返回 usage，这一条的用量未知">?</span>`
+        : fmtNum(e.total_tokens || e.total || 0);
       return `<tr>
         <td class="nowrap">${fmtTime(e.time)}</td>
         <td><span class="tag blue">${esc(proto)}</span></td>
@@ -1247,7 +1254,7 @@
         <td><span class="tag ${statusCls}">${e.status}</span></td>
         <td class="num">${fmtDur(e.duration_ms)}</td>
         <td class="num">${fmtDur(e.ttfb_ms)}</td>
-        <td class="num">${fmtNum(tokens)}</td>
+        <td class="num">${tokens}</td>
         <td>${e.error_kind ? `<span class="err-text" title="${esc(e.error || "")}">${esc(e.error_kind)}</span>` : (e.stream ? `<span class="tag">流式</span>` : "")}</td>
       </tr>`;
     }).join("");

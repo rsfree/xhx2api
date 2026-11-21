@@ -273,9 +273,20 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		Status: status, ErrorKind: t.errKind, Error: t.errMsg,
 		DurationMS: time.Since(t.start).Milliseconds(), TTFBMS: t.ttfbMS,
 		Prompt: t.prompt, Completion: t.completion, Total: t.total,
-		Stream: t.stream, Attempts: t.attempts, Rotations: t.rotations,
+		UsageMissing: t.usageMissing(),
+		Stream:       t.stream, Attempts: t.attempts, Rotations: t.rotations,
 		ClientIP: t.clientIP, UserAgent: t.userAgent,
 	}
+}
+
+// usageMissing 报告这一条有没有拿到上游的用量。
+//
+// 网关不自己数 token，只读上游回的 usage（见 tokenCounts）。上游不给、或给了
+// 全 0 时，三个数都是 0；而任何真实请求的 prompt_tokens 都不可能为 0，所以
+// 「全 0」就是「没记上」。这跟「真的没消耗」是两件事——2026-11-03 线上出现过
+// 200 / 3m32s / 0 token 的记录，TTFB 与总耗时相等、流里没有 usage，账本记 0。
+func (t *requestTrace) usageMissing() bool {
+	return t.prompt == 0 && t.completion == 0 && t.total == 0
 }
 
 // responseObserver 记录状态码与「是否已写过」。
@@ -755,8 +766,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if _, rerr := h.cfg.Upstream.RefreshTokenIfNeeded(r.Context(), a, h.cfg.RefreshSkew); rerr != nil {
 			log.Printf("WARN: [refresh] %s: %v", a.UID, rerr)
 		}
+		// callStart 只量「本次调上游」：选号排队与 token 续期不算——否则 TTFB
+		// 会把排队读成「上游慢」，短请求尤其失真。
+		callStart := time.Now()
 		stream, status, rawErr, cerr := h.cfg.Upstream.ChatStream(r.Context(), a, body, req.TurnTitle)
-		latency := time.Since(started)
+		latency := time.Since(callStart)
 		if cerr != nil {
 			kind := classifyErr(cerr, status, string(rawErr))
 			msg := cerr.Error()
@@ -842,7 +856,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		_ = stream.Close()
 		if aerr != nil {
 			kind := classifyErr(aerr, 0, aerr.Error())
-			lease.Release(&kind, aerr.Error(), time.Since(started))
+			lease.Release(&kind, aerr.Error(), time.Since(callStart))
 			lastErr = aerr
 			if tr != nil {
 				tr.errKind = kind
@@ -870,7 +884,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if !escalated {
 				escalated = true
 				body = raiseMaxTokens(body, escalatedMaxTokens)
-				lease.ReleaseSuccess(time.Since(started))
+				lease.ReleaseSuccess(time.Since(callStart))
 				if tr != nil {
 					tr.rotations++
 				}
@@ -878,7 +892,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			promptTokens, completionTokens, total := tokenCounts(obj["usage"])
-			lease.ReleaseSuccess(time.Since(started))
+			lease.ReleaseSuccess(time.Since(callStart))
 			if tr != nil {
 				tr.prompt, tr.completion, tr.total = promptTokens, completionTokens, total
 				tr.errKind, tr.errMsg = "reasoning_exhausted", "思考耗尽输出额度"
@@ -890,7 +904,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		promptTokens, completionTokens, total := tokenCounts(obj["usage"])
-		lease.ReleaseSuccess(time.Since(started))
+		lease.ReleaseSuccess(time.Since(callStart))
 		if tr != nil {
 			tr.prompt, tr.completion, tr.total = promptTokens, completionTokens, total
 		}
@@ -1086,7 +1100,6 @@ func shouldRotate(kind pool.ErrKind) bool {
 	return false
 }
 
-// errorResponse 把错误映射成面向客户端的 (status, code, message)。
 // errorResponse 把错误映射成面向客户端的 (status, code, message)。
 // errorResponse 把错误映射成面向客户端的 (status, code, message)。
 //

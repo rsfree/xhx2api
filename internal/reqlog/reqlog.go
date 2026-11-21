@@ -40,11 +40,15 @@ type Event struct {
 	Prompt     int64     `json:"prompt_tokens,omitempty"`
 	Completion int64     `json:"completion_tokens,omitempty"`
 	Total      int64     `json:"total_tokens,omitempty"`
-	Stream     bool      `json:"stream,omitempty"`
-	Attempts   int       `json:"attempts,omitempty"`
-	Rotations  int       `json:"rotations,omitempty"`
-	ClientIP   string    `json:"client_ip,omitempty"`
-	UserAgent  string    `json:"user_agent,omitempty"`
+	// UsageMissing 表示上游没回 usage：token 全 0 **不等于**零消耗。
+	// 面板要显示「?」而不是 0，否则这些记录会把 tokens 总量与均值一起拉低，
+	// 看起来像「用了很多次但几乎没花 token」。
+	UsageMissing bool   `json:"usage_missing,omitempty"`
+	Stream       bool   `json:"stream,omitempty"`
+	Attempts     int    `json:"attempts,omitempty"`
+	Rotations    int    `json:"rotations,omitempty"`
+	ClientIP     string `json:"client_ip,omitempty"`
+	UserAgent    string `json:"user_agent,omitempty"`
 }
 
 // ModelMetric 是按模型聚合。
@@ -72,6 +76,9 @@ type Metrics struct {
 	LatencyAvg  int64                   `json:"latency_avg_ms"`
 	RPM         float64                 `json:"rpm"`
 	TokensTotal int64                   `json:"tokens_total"`
+	// Unmetered 是「上游没回 usage」的条数：这些请求的 token 记 0，但不代表
+	// 没消耗。看 Token 总量时必须连同这个数一起看，否则「没记上」会被读成「省」。
+	Unmetered int64 `json:"unmetered"`
 }
 
 // Config 是归档参数。
@@ -170,6 +177,9 @@ func (r *Recorder) Record(ev Event) {
 		mm.SumMS += ev.DurationMS
 	}
 	r.metrics.TokensTotal += ev.Total
+	if ev.UsageMissing {
+		r.metrics.Unmetered++
+	}
 	if ev.DurationMS > 0 {
 		r.latency = append(r.latency, ev.DurationMS)
 		if len(r.latency) > 512 {

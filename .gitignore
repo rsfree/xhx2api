@@ -19,3 +19,7 @@ config.json
 
 # .workbuddy 是项目数据（记忆/分析），不进仓库
 .workbuddy/
+
+# Python 探针脚本的字节码
+__pycache__/
+*.pyc

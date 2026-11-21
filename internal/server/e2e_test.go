@@ -23,6 +23,7 @@ import (
 	"github.com/rsfree/xhx2api/internal/auth"
 	"github.com/rsfree/xhx2api/internal/livecfg"
 	"github.com/rsfree/xhx2api/internal/pool"
+	"github.com/rsfree/xhx2api/internal/reqlog"
 	"github.com/rsfree/xhx2api/internal/session"
 	"github.com/rsfree/xhx2api/internal/upstream"
 )
@@ -52,6 +53,8 @@ type testEnv struct {
 	editHasFile   bool
 	editHasModel  bool
 	editFileCount int
+	// reqLog 是请求账本：断言「用量缺失」这类只体现在记账里的行为。
+	reqLog *reqlog.Recorder
 }
 
 // setupEnv 建测试装置。fakeHandler 处理 /api/web/llm/v2/chat/completions。
@@ -180,6 +183,8 @@ func setupEnv(t *testing.T, fakeHandler http.HandlerFunc, uids ...string) *testE
 
 	router := session.New(session.Config{TTL: time.Minute, GCInterval: time.Minute})
 	t.Cleanup(router.Close)
+	// 请求账本常开：抓「记账」类行为的测试不用各自再搭一套。
+	env.reqLog = reqlog.New(reqlog.Config{RingSize: 64})
 	env.handler = NewHandler(Config{
 		Pool: p, Upstream: up, MaxRotate: 3, DefaultModel: "raccoon-8c4485",
 		Aliases:        map[string]string{"gpt-4o": "raccoon-chat-ml-5-5"},
@@ -188,6 +193,7 @@ func setupEnv(t *testing.T, fakeHandler http.HandlerFunc, uids ...string) *testE
 		StickyByPrefix: false, // 默认：前缀不粘性，靠显式 session id 或纯轮转
 		Version:        "test",
 		MaxBodyBytes:   4 << 20,
+		RequestLog:     env.reqLog,
 	})
 	env.gateway = httptest.NewServer(env.handler)
 	t.Cleanup(env.gateway.Close)
@@ -2609,6 +2615,84 @@ func TestClientErrorNotCountedAgainstAccount(t *testing.T) {
 	}
 }
 
+// waitEvent 等一条请求记录落账。
+//
+// 记录发生在 ServeHTTP 的 defer 里，客户端读完流的那一刻可能还没执行到，
+// 所以只能轮询——固定 sleep 在慢机器上会偶发失败。
+func waitEvent(t *testing.T, rec *reqlog.Recorder) reqlog.Event {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if evs := rec.Recent(1); len(evs) > 0 {
+			return evs[0]
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("等不到请求记录")
+	return reqlog.Event{}
+}
+
+// TestRequestLogMarksMissingUsage 守「用量缺失」的口径。
+//
+// 上游把整段答案一次吐完、且流里不带 usage 时，三个 token 全是 0；但网关不自己
+// 数 token，这个 0 只表示「没记上」。2026-11-03 线上出现过这种记录：200 / 3m32s /
+// 0 token，TTFB 与总耗时相等、流里没有 usage。面板据此显示 ? 而不是 0，否则
+// 这些记录会把 tokens 总量与均值一起拉低。
+func TestRequestLogMarksMissingUsage(t *testing.T) {
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprint(w, `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"raccoon-8c4485","choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":null}]}`+"\n\n")
+		fmt.Fprint(w, `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"raccoon-8c4485","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model":    "raccoon-8c4485",
+		"stream":   true,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("读流失败: %v", err)
+	}
+	ev := waitEvent(t, env.reqLog)
+	if ev.Status != 200 {
+		t.Fatalf("status = %d", ev.Status)
+	}
+	if !ev.UsageMissing {
+		t.Fatalf("上游没回 usage 时应标记 usage_missing，实际 %+v", ev)
+	}
+	if ev.Total != 0 {
+		t.Fatalf("total = %d，期望 0（上游没给）", ev.Total)
+	}
+	// 面板「Token 总量」卡片要靠这个数说明「总量偏低是没记账，不是省」。
+	if got := env.reqLog.Metrics().Unmetered; got != 1 {
+		t.Fatalf("unmetered = %d，期望 1", got)
+	}
+}
+
+// TestRequestLogKeepsRealUsage 是上一条的对照：真拿到 usage 时不能误标成缺失，
+// 否则「?」会变成常态，等于把信号淹掉。
+func TestRequestLogKeepsRealUsage(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "你好"))
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model":    "raccoon-8c4485",
+		"stream":   true,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("读流失败: %v", err)
+	}
+	ev := waitEvent(t, env.reqLog)
+	if ev.UsageMissing {
+		t.Fatalf("有 usage 却标成缺失: %+v", ev)
+	}
+	if ev.Total != 19 {
+		t.Fatalf("total = %d，期望 19", ev.Total)
+	}
+	if got := env.reqLog.Metrics().Unmetered; got != 0 {
+		t.Fatalf("有 usage 却被记成未记账 %d 条", got)
+	}
+}
+
 // TestImageEndpointIgnoresModelName 守「按端点路由，model 随便填」。
 //
 // 上游 /images/gen 完全忽略 model（2026-10-26 真号实测：gpt-image-2、gpt-image-2.5
@@ -2668,6 +2752,7 @@ func TestImageEditsIgnoresModelName(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
 // 流终态与流内错误契约（chat-adapter 的硬红线）
 
 // sseNoFinish 模拟「上游说完半句就收流」：正文帧 + [DONE]，但没有 finish_reason。
