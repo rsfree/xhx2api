@@ -17,6 +17,13 @@ import (
 	"time"
 )
 
+// ErrStreamInterrupted 表示上游在没给 finish_reason 的情况下结束了流。
+//
+// 绝不能补一个 stop 当成功：客户端会把半截答案写进上下文，工具参数里的半截
+// JSON 还会被真的拿去执行，故障发生在离网关很远的地方。显式失败才能让调用方
+// 重试，也才能让「上游契约质量」在面板上可量化。
+var ErrStreamInterrupted = errors.New("上游流缺少 finish_reason（截断）")
+
 // ErrReasoningExhausted 表示输出额度被思考吃光：finish_reason=length、
 // 正文为空、但思考内容非空。
 //
@@ -202,7 +209,8 @@ func classifyErrorText(raw string) ErrKind {
 	if quotaSignal(lower) {
 		return ErrPlanLimit
 	}
-	if strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many") || strings.Contains(raw, "429") {
+	if limiterSignal(lower) || strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "too many") || strings.Contains(raw, "429") {
 		return ErrSoftRate
 	}
 	if sessionDeadSignal(lower) || strings.Contains(raw, "401") {
@@ -393,6 +401,17 @@ func (a *accumulator) result() map[string]any {
 	}
 }
 
+// final 产出非流式结果；没有 finish_reason 时按截断失败。
+//
+// 非流式也要这条判据：客户端拿到的是一份「完整」JSON，一旦把截断的内容当完整
+// 回复，它没有任何线索能发现。
+func (a *accumulator) final() (map[string]any, error) {
+	if a.finish == "" {
+		return nil, ErrStreamInterrupted
+	}
+	return a.result(), nil
+}
+
 // delta 是一条要写给客户端的增量。
 type delta struct {
 	kind      int
@@ -428,7 +447,8 @@ func Aggregate(r io.Reader, model string) (map[string]any, error) {
 			if !acc.sawAny {
 				return nil, true, ErrEmptyStream
 			}
-			return acc.result(), true, nil
+			out, ferr := acc.final()
+			return out, true, ferr
 		case sseChunk:
 			acc.add(event.Chunk)
 		}
@@ -456,7 +476,7 @@ func Aggregate(r io.Reader, model string) (map[string]any, error) {
 			if !acc.sawAny {
 				return nil, ErrEmptyStream
 			}
-			return acc.result(), nil
+			return acc.final()
 		}
 		if err != nil {
 			return nil, err
@@ -549,6 +569,18 @@ func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*StreamError
 		return write(chunk)
 	}
 	done := func() error { return writeRaw("data: [DONE]\n\n") }
+	// fail 写一帧标准四键错误并收尾。首包已发时 HTTP 状态改不了，这是唯一能让
+	// 客户端知道「内容不完整 / 这次失败」的通道；不能把 error 塞进 delta，
+	// 客户端只会看到一条空的正常回复。
+	fail := func(code, typ, msg string) {
+		_ = write(map[string]any{"error": map[string]any{
+			"message": msg,
+			"type":    typ,
+			"param":   nil,
+			"code":    code,
+		}})
+		_ = done()
+	}
 
 	handle := func(event sseEvent) (bool, error) {
 		switch event.Kind {
@@ -562,9 +594,11 @@ func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*StreamError
 				// 一个字节都没发：让调用方决定换号重试。
 				return true, se.AsError()
 			}
-			_ = write(map[string]any{"error": map[string]any{"message": event.Message, "type": "proxy_error", "detail": event.Raw}})
-			_ = done()
-			return true, nil
+			code, typ, msg := publicStreamError(event.Class)
+			fail(code, typ, msg)
+			// 一定要把错误交回上层：以前这里 return nil，流内错误会被记成成功，
+			// 账号不冷却、面板成功率虚高。
+			return true, se.AsError()
 		case sseDone:
 			return true, nil
 		case sseChunk:
@@ -584,10 +618,8 @@ func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*StreamError
 				if onErr != nil {
 					onErr(se)
 				}
-				_ = write(map[string]any{"error": map[string]any{
-					"message": se.Msg, "type": "proxy_error", "code": "upstream_reasoning_loop"}})
-				_ = done()
-				return true, nil
+				fail("upstream_reasoning_loop", "server_error", se.Msg)
+				return true, se.AsError()
 			}
 			for _, d := range deltas {
 				payload := map[string]any{}
@@ -628,7 +660,7 @@ func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*StreamError
 					return nil, herr
 				}
 				if stop {
-					return finishStream(acc, send, done)
+					return finishStream(acc, send, done, fail)
 				}
 			}
 		}
@@ -639,10 +671,10 @@ func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*StreamError
 					return nil, herr
 				}
 				if stop {
-					return finishStream(acc, send, done)
+					return finishStream(acc, send, done, fail)
 				}
 			}
-			return finishStream(acc, send, done)
+			return finishStream(acc, send, done, fail)
 		}
 		if err != nil {
 			return nil, err
@@ -650,27 +682,46 @@ func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*StreamError
 	}
 }
 
-// finishStream 收尾：空流报错（调用方还能换号），否则补 finish_reason 与 [DONE]。
-func finishStream(acc *accumulator, send func(map[string]any, string) error, done func() error) (map[string]any, error) {
+// publicStreamError 把流内错误映射成公开四键。
+//
+// 文案固定、不回显上游原文：原文里可能带账号、内部域名或请求 ID。原文留在
+// 网关日志（serveStream 的 errMsg）里给运维看，不往客户端吐。
+func publicStreamError(k ErrKind) (code, typ, msg string) {
+	switch k {
+	case ErrPlanLimit:
+		return "insufficient_quota", "rate_limit_error", "上游账号额度不足，请稍后重试"
+	case ErrSoftRate:
+		return "rate_limit_exceeded", "rate_limit_error", "上游限流，请稍后重试"
+	case ErrClient:
+		return "invalid_request", "invalid_request_error", "上游拒绝了本次请求（参数不合法）"
+	case ErrSessionDead:
+		return "account_session_expired", "server_error", "上游账号登录态已失效，请重新登录"
+	}
+	return "upstream_error", "api_error", "上游返回错误，请稍后重试"
+}
+
+// finishStream 收尾：空流报错（调用方还能换号）、缺终态按截断报错，
+// 否则补 finish_reason 与 [DONE]。
+func finishStream(acc *accumulator, send func(map[string]any, string) error, done func() error,
+	fail func(code, typ, msg string)) (map[string]any, error) {
 	if !acc.sawAny && acc.finish == "" {
 		return nil, ErrEmptyStream
+	}
+	// 先判截断再谈 tools：工具流没给 finish_reason 同样可能是参数被截断，
+	// 不能因为「有 tool_calls」就默认完整。
+	if acc.finish == "" {
+		fail("stream_interrupted", "api_error", "上游流在给出 finish_reason 之前结束，内容可能不完整")
+		return acc.usage, ErrStreamInterrupted
 	}
 	finish := acc.finish
 	if len(acc.tools) > 0 {
 		finish = "tool_calls"
 	}
-	if finish == "" {
-		finish = "stop"
-	}
 	// 思考吃光额度：正文一个字都没有，只发了思考。这时代码层面没有 error，
 	// 客户端会收到一个「空的正常回复」。补一帧 error 说清楚，比静默空响好。
 	if finish == "length" && acc.content.Len() == 0 && acc.reasoning.Len() > 0 && len(acc.tools) == 0 {
-		_ = send(map[string]any{"error": map[string]any{
-			"message": "思考耗尽输出额度：模型把 max_tokens 全用于思考，正文为空。请提高 max_tokens 后重试",
-			"type":    "invalid_request_error",
-			"code":    "reasoning_exhausted",
-		}}, "stop")
-		_ = done()
+		fail("reasoning_exhausted", "invalid_request_error",
+			"思考耗尽输出额度：模型把 max_tokens 全用于思考，正文为空。请提高 max_tokens 后重试")
 		return acc.usage, ErrReasoningExhausted
 	}
 	if err := send(map[string]any{}, finish); err != nil {

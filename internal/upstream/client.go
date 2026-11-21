@@ -193,6 +193,18 @@ var (
 // ---------------------------------------------------------------------------
 // 错误分类判据
 
+// limiterSignal 是上游限流器的固定口令。
+//
+// 实测正文 `{"code":200103,"message":"limiter_request_error",
+// "details":"request exceed max time, retry after:0s"}`：HTTP 层是 429，
+// 但流内错误帧没有状态码，只能靠这三个固定串认出来。认不出来的代价是
+// 这条错误被归成 none —— 既不计失败也不冷却，面板看上去风平浪静。
+func limiterSignal(lower string) bool {
+	return strings.Contains(lower, "limiter_request_error") ||
+		strings.Contains(lower, "request exceed max time") ||
+		strings.Contains(lower, "200103")
+}
+
 // quotaSignal 文案里是否**确实**在说额度/余额不足。
 //
 // 不能只匹配 "insufficient"：上下文超限的报文里也有这个词，会把好号判成欠费。

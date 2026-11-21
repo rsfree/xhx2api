@@ -702,8 +702,13 @@ go run ./cmd/livecheck -base ... -key ... -all-models
   1024 仍会偶尔被吃光。所以两层防护：
   1. 出站下限抬到 2048（额度是上限不是花费，抬了不多扣）；
   2. 非流式检测到「正文空 + finish=length + 有思考」时，**自动把额度加到 8192 重试一次**；
-     流式没法重试（思考帧已经发出去），在收尾补一帧
-     `{"error":{"code":"reasoning_exhausted"}}`，让客户端看到原因而不是一条空消息。
+     流式没法重试（思考帧已经发出去），在收尾补一帧顶层
+     `{"error":{"message,type,param,code}}`（`code=reasoning_exhausted`），
+     让客户端看到原因而不是一条空消息。
+- **错误体不带上游原文**：上游 4xx/5xx 的 message 可能含账号、内部域名、请求 ID，
+  公开响应只给固定文案 + 标准 `code`；原文写进网关日志与面板「请求」明细的
+  error 字段，排障照旧。上游账号登录态失效对外是 **503**（`account_session_expired`），
+  不是 401——401 会让客户端以为自己的 key 错了，去换 key 而不是等运维续期。
 - **`title` 只走 Header，不进 body**：真号实测 `raccoon-8c4485` 对未声明字段严格校验，
   body 里多一个 `title` 直接 HTTP 500 `Unexpected keyword argument 'title'`。
   网关把它摘出来、转成 `X-RACCOON-Title` 发出去——这一条 Header 会被上游写进

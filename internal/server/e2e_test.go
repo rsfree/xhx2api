@@ -2667,3 +2667,275 @@ func TestImageEditsIgnoresModelName(t *testing.T) {
 		t.Fatal("model 不该出现在发给上游的 multipart 里")
 	}
 }
+
+// 流终态与流内错误契约（chat-adapter 的硬红线）
+
+// sseNoFinish 模拟「上游说完半句就收流」：正文帧 + [DONE]，但没有 finish_reason。
+func sseNoFinish(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(200)
+	fmt.Fprint(w, `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"raccoon-8c4485","choices":[{"index":0,"delta":{"content":"半句话"},"finish_reason":null}]}`+"\n\n")
+	fmt.Fprint(w, "data: [DONE]\n\n")
+}
+
+// TestStreamInterruptedWithoutFinish 守「没有 finish_reason 就不算成功」。
+//
+// 以前网关会把 EOF/[DONE] 当成正常结束、补一个 stop：客户端把半截答案当完整
+// 回复写进上下文，工具参数里的半截 JSON 还会被真的执行。现在必须发一帧
+// stream_interrupted 再收流，且**不能**出现任何 finish_reason。
+func TestStreamInterruptedWithoutFinish(t *testing.T) {
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) { sseNoFinish(w) })
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model": "raccoon-8c4485", "stream": true,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("流已开始，HTTP 应为 200，得到 %d", resp.StatusCode)
+	}
+	sawErr, sawDone := false, false
+	for _, f := range readSSE(t, resp) {
+		if f[1] == "[DONE]" {
+			sawDone = true
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(f[1]), &chunk); err != nil {
+			t.Fatalf("坏帧: %s", f[1])
+		}
+		if choices, ok := chunk["choices"].([]any); ok && len(choices) > 0 {
+			choice := choices[0].(map[string]any)
+			if finish, ok := choice["finish_reason"].(string); ok && finish != "" {
+				t.Fatalf("截断流不能出现 finish_reason=%q（伪造 stop 会让半截内容变完整）", finish)
+			}
+		}
+		if e, ok := chunk["error"].(map[string]any); ok {
+			sawErr = true
+			if e["code"] != "stream_interrupted" {
+				t.Fatalf("error.code = %v，期望 stream_interrupted", e["code"])
+			}
+			assertPublicErrorKeys(t, e)
+		}
+	}
+	if !sawErr {
+		t.Fatal("截断流应当发一帧 stream_interrupted")
+	}
+	if !sawDone {
+		t.Fatal("错误帧之后应补 [DONE]")
+	}
+}
+
+// TestNonStreamInterruptedIs502 是非流式的同一口径：聚合结果没有 finish_reason
+// 时不能回一份「看起来完整」的 JSON。
+func TestNonStreamInterruptedIs502(t *testing.T) {
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) { sseNoFinish(w) })
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model":    "raccoon-8c4485",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("HTTP = %d，期望 502", resp.StatusCode)
+	}
+	obj := readJSON(t, resp)
+	e, _ := obj["error"].(map[string]any)
+	if e["code"] != "stream_interrupted" {
+		t.Fatalf("error.code = %v", e["code"])
+	}
+	assertPublicErrorKeys(t, e)
+}
+
+// TestStreamErrorFrameIsPublicShape 守「流内错误帧只允许四键、且不泄露上游原文」。
+//
+// 上游的 429 信封里带 details（含 retry after、内部文案）。以前网关把整个
+// Raw 塞进 detail 字段、type 写成非标准的 proxy_error，还把这条流记成成功。
+func TestStreamErrorFrameIsPublicShape(t *testing.T) {
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprint(w, `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"raccoon-8c4485","choices":[{"index":0,"delta":{"content":"开头"},"finish_reason":null}]}`+"\n\n")
+		fmt.Fprint(w, `data: {"code":200103,"message":"limiter_request_error","details":"request exceed max time, retry after:0s"}`+"\n\n")
+	})
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model": "raccoon-8c4485", "stream": true,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	raw := ""
+	sawErr := false
+	for _, f := range readSSE(t, resp) {
+		raw += f[1] + "\n"
+		if f[1] == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(f[1]), &chunk); err != nil {
+			t.Fatalf("坏帧: %s", f[1])
+		}
+		e, ok := chunk["error"].(map[string]any)
+		if !ok {
+			continue
+		}
+		sawErr = true
+		assertPublicErrorKeys(t, e)
+		if e["code"] != "rate_limit_exceeded" {
+			t.Fatalf("error.code = %v，期望 rate_limit_exceeded", e["code"])
+		}
+	}
+	if !sawErr {
+		t.Fatal("上游流内报错时应当发 error 帧")
+	}
+	for _, banned := range []string{"limiter_request_error", "retry after", "details", "200103"} {
+		if strings.Contains(raw, banned) {
+			t.Fatalf("错误帧泄露了上游原文 %q:\n%s", banned, raw)
+		}
+	}
+	// 流内错误不是成功：账号必须记一次失败（这里按限流进冷却）。
+	if got := env.pool.Counts().Cooling; got == 0 {
+		t.Fatal("流内 429 应当让账号进入冷却，而不是记成功")
+	}
+}
+
+// TestReasoningExhaustedFrameShape 守「思考耗尽」的收尾帧：以前是把 error 塞进
+// delta 再补 finish_reason=stop，客户端只会看到一条空的正常回复。
+func TestReasoningExhaustedFrameShape(t *testing.T) {
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprint(w, `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"raccoon-8c4485","choices":[{"index":0,"delta":{"reasoning_content":"想了很久"},"finish_reason":null}]}`+"\n\n")
+		fmt.Fprint(w, `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"raccoon-8c4485","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model": "raccoon-8c4485", "stream": true,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	sawErr := false
+	for _, f := range readSSE(t, resp) {
+		if f[1] == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(f[1]), &chunk); err != nil {
+			t.Fatalf("坏帧: %s", f[1])
+		}
+		if choices, ok := chunk["choices"].([]any); ok && len(choices) > 0 {
+			delta, _ := choices[0].(map[string]any)["delta"].(map[string]any)
+			if _, bad := delta["error"]; bad {
+				t.Fatal("error 不能塞在 delta 里（客户端会当成空回复）")
+			}
+		}
+		e, ok := chunk["error"].(map[string]any)
+		if !ok {
+			continue
+		}
+		sawErr = true
+		assertPublicErrorKeys(t, e)
+		if e["code"] != "reasoning_exhausted" || e["type"] != "invalid_request_error" {
+			t.Fatalf("收尾帧 = %v", e)
+		}
+	}
+	if !sawErr {
+		t.Fatal("思考耗尽应当发一帧 error")
+	}
+}
+
+// assertPublicErrorKeys 断言公开错误体恰好四键。
+func assertPublicErrorKeys(t *testing.T, e map[string]any) {
+	t.Helper()
+	if len(e) != 4 {
+		t.Fatalf("公开错误只允许 4 个键，得到 %d 个: %v", len(e), e)
+	}
+	for _, k := range []string{"message", "type", "param", "code"} {
+		if _, ok := e[k]; !ok {
+			t.Fatalf("缺少 %q: %v", k, e)
+		}
+	}
+}
+
+// TestErrorBodyDoesNotLeakUpstreamText 守「错误不回显客户端，明细只留服务端」。
+//
+// 上游 500 的正文里可能有内部域名、账号、请求 ID、半截报文。公开体只能是网关
+// 自己写的固定文案；原文必须留在服务端——账号 last_error（面板看得到）+ 日志。
+func TestErrorBodyDoesNotLeakUpstreamText(t *testing.T) {
+	const secret = "INTERNAL-SECRET-9f3a"
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 500, map[string]any{"error": map[string]any{
+			"message": secret + " at http://10.0.0.7/admin?token=abc", "code": "internal",
+		}})
+	})
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model":    "raccoon-8c4485",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("HTTP = %d: %s", resp.StatusCode, raw)
+	}
+	for _, banned := range []string{secret, "10.0.0.7", "token=abc"} {
+		if strings.Contains(string(raw), banned) {
+			t.Fatalf("公开错误回显了上游内容 %q：%s", banned, raw)
+		}
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("错误体不是 JSON: %s", raw)
+	}
+	e, _ := obj["error"].(map[string]any)
+	if e["message"] != "上游返回错误，请稍后重试" {
+		t.Fatalf("公开 message 应是固定文案，得到 %v", e["message"])
+	}
+	// 服务端必须留下原文：面板的账号 last_error 靠它排障。
+	found := false
+	for _, it := range env.pool.List() {
+		if strings.Contains(it.LastError, secret) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("上游原文应当留在账号 last_error 里，实际 %+v", env.pool.List())
+	}
+}
+
+// TestSessionDeadIs503 守「上游账号登录态失效」的状态码语义。
+//
+// 回 401 等于告诉客户端「你的 API key 错了」，它会去换 key / 重新认证；真正
+// 要动的是网关侧的账号池。503 才是「服务端暂不可用」。
+func TestSessionDeadIs503(t *testing.T) {
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 401, map[string]any{"error": map[string]any{
+			"message": "token expired", "code": "401",
+		}})
+	})
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model":    "raccoon-8c4485",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("HTTP = %d，期望 503：%s", resp.StatusCode, raw)
+	}
+	var obj map[string]any
+	_ = json.Unmarshal(raw, &obj)
+	e, _ := obj["error"].(map[string]any)
+	if e["code"] != "account_session_expired" {
+		t.Fatalf("error.code = %v", e["code"])
+	}
+}
+
+// TestTruncatedNonStreamRetriesOnce 守「截断只换一次号」。
+//
+// 那次被截断的生成上游已经扣过费；重试是**新的真实生成**，要再扣一次。
+// 上游系统性截断时按 MaxRotate 打满等于 3 倍成本换同一个失败，所以上限是 1。
+func TestTruncatedNonStreamRetriesOnce(t *testing.T) {
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) { sseNoFinish(w) }, "1001", "1002", "1003")
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model":    "raccoon-8c4485",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("HTTP = %d：%s", resp.StatusCode, raw)
+	}
+	if got := env.chatHits.Load(); got != 2 {
+		t.Fatalf("截断应当只重试一次（共 2 次上游调用），实际 %d 次：每次重试都要计费", got)
+	}
+}

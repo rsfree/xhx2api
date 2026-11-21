@@ -27,6 +27,12 @@ tag 与 `latest`（默认分支）。
   还要：登进 `cmd/server/config.go` 的 `deprecatedConfigKeys`（严格解析前摘掉、
   保存时从磁盘抹掉）、补一条「老配置能解析 + 未知键仍报错」的测试
   （见 `TestParseConfigAcceptsDeprecatedImagesModel`）；
+- **公开错误体只放网关卡自己写的固定文案**：上游原文（可能带账号、内部域名、
+  请求 ID、半截报文）只能进日志、面板请求明细（`trace.errMsg`）与账号 `last_error`。
+  三个出口都要守：`errorResponse`（非流式 / 首包前失败）、`publicStreamError`
+  （流已开始后的 error 帧）、`writeOpenAIError/writeAnthropicError` 的 message。
+  别做「替换密钥后回显」——局部替换挡不住别的敏感字段。测试
+  `TestErrorBodyDoesNotLeakUpstreamText`；
 - 配置/凭证/池状态的落盘统一是「写 `.tmp` → rename」：**配置只能目录挂载**
   （`./conf:/app/conf` + `-config /app/conf/config.json`）。挂成单文件
   `./config.json:/app/config.json` 时，`rename` 的目标是 bind mount 的 mountpoint，
@@ -118,6 +124,8 @@ tag 与 `latest`（默认分支）。
 | image 字段形态 | 三种都收：单张字符串 / 字符串数组 / `null`（= 无图）；元素可为 data URI 或**裸 base64**（含 URL-safe、缺 padding）。`/v1/images/edits` 收 multipart 与 JSON；multipart 下 `image`/`image[]` 可为**文件**或**base64 文本**（同名重复即数组），`mask` 同理。数组里有非字符串 → 400（不静默丢图） | `extractImageRefs`、`decodeImageRef`、`imageEdits` |
 | 生图响应形态 | **默认回 url**（不传 `response_format` / 传 `null`/`None` → `data[0].url`，不附 b64）；`response_format=b64_json` → 只回 b64 且**不落盘**；配置 `images.response_format=both` → 两者都给。落盘失败或无存储 → 回落 b64 + 头 `X-XHX-Image-URL: unavailable`，绝不回 `url:null` | `server.resolveResponseFormat`、`attachImageURLs` |
 | 图片落盘与回收 | 内容寻址 `<sha256前16字节>.<ext>`，`GET /v1/images/<name>` 免鉴权、`immutable` 缓存；超过 `images.max_total_mb`（默认 2048，0=不限）按 mtime 删最旧到 90%，**只删 `imageNameOK` 认得的文件**，节流 1 分钟 | `sweepImageDir` |
+| 流式终态 | 上游在给 `finish_reason` 之前收流（含只有 `[DONE]`/EOF）**一律按截断**：已发过帧就补一帧 `{"error":…code=stream_interrupted}` + `[DONE]`，没发过帧就回 502；**绝不补 `stop`**（补了客户端会把半截答案写进上下文、半截工具参数拿去执行）。非流式聚合同样判 `finish_reason`，缺失直接 502。流内错误帧只允许四键（`message/type/param/code`），上游原文只进日志 | `sse.go` 的 `final` / `finishStream` / `publicStreamError`；测试 `TestStreamInterruptedWithoutFinish` 等四条 |
+| 流内限流识别 | 上游流内错误 `{"code":200103,"message":"limiter_request_error","details":"request exceed max time…"}` 没有 HTTP 状态码，靠 `limiterSignal` 三个固定串认成 `soft_rate`；认不出来会被归成 `none`（不计失败、不冷却，面板全绿但实际在失败） | `client.go#limiterSignal`、`sse.go#classifyErrorText` |
 | 生图 `model` 字段 | **完全被忽略**（2026-10-26 实测）：`gpt-image-2`、`gpt-image-2.5`、捏造名全 200，1024x1024 的 `image_tokens` 都是 196；响应体不回 `model`。别指望它切模型，也**别加模型名校验**：按端点路由，空串/别名/对话模型名/随手编的名字都出图（`TestImageEndpointIgnoresModelName`）。`images.model` 配置已删除——上游没有第二个模型可选；老配置里的键由 `deprecatedConfigKeys` 忽略并在保存时抹掉 | `upstream.ImageAliases` 注释、`cmd/server/config.go` |
 | 生图 size | **两条约束**：①最长边 ≤ 3840（超了先跑 106s 再 400）；②总像素 ≤ 8,294,400 = 3840×2160（超了**不报错**，静默降级：3840x3840 → 2880x2880）。实测 `1024x1024`→196 tokens、`1536x1024`→158、`1792x1024`→139、`3840x2160`(4K)→371 | `upstream.ClampImageSize` 提前按两条约束等比压，响应头 `X-XHX-Image-Size` |
 | 4K + quality | `3840x2160&quality=high` → 13342 image_tokens（默认档 371，36 倍）、136s、1806KB；quality 对耗时几乎无影响 | 同上 |

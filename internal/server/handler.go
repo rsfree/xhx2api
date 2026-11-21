@@ -720,6 +720,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	escalated := false
 	// clamped 表示已经为「max_tokens 超上限」收过一次，避免同一份 body 反复撞。
 	clamped := false
+	// truncated 表示已经为「上游截断」换过一次号。
+	//
+	// 截断本身不额外花钱（那次生成上游已经跑过、照价扣了），但**重试**是一次
+	// 新的真实生成，要再付一次。所以只给它一次机会，不能按 MaxRotate 打满：
+	// 上游系统性截断时，3 次重试就是 3 倍成本换同一个失败。
+	truncatedRetried := false
 	excluded := map[string]bool{}
 	for attempt := 0; attempt < h.cfg.MaxRotate; attempt++ {
 		if tr != nil {
@@ -804,6 +810,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			lease.Release(&kind, msg, latency)
 			lastErr = cerr
+			// 明细只进服务端：日志 + 面板请求明细（tr.errMsg）+ 账号 last_error。
+			// 客户端只会拿到 errorResponse 里的固定文案。
+			if tr != nil {
+				tr.errKind, tr.errMsg = kind, msg
+			}
 			log.Printf("WARN: [chat] uid=%s model=%s attempt=%d kind=%s: %v", a.UID, model, attempt+1, kind, cerr)
 			if !shouldRotate(kind) {
 				break
@@ -839,6 +850,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("WARN: [chat] uid=%s model=%s attempt=%d 聚合失败 kind=%s: %v", a.UID, model, attempt+1, kind, aerr)
 			if kind == "server" || kind == "gateway" {
+				if errors.Is(aerr, upstream.ErrStreamInterrupted) {
+					if truncatedRetried {
+						break
+					}
+					truncatedRetried = true
+				}
 				excluded[a.UID] = true
 				if tr != nil {
 					tr.rotations++
@@ -1027,6 +1044,13 @@ func classifyErr(err error, status int, body string) pool.ErrKind {
 	switch {
 	case errors.Is(err, upstream.ErrEmptyStream):
 		return upstream.ErrServer.String()
+	case errors.Is(err, upstream.ErrStreamInterrupted):
+		// 截断更像链路/上游契约问题：换号未必有用，按 gateway 短暂回避即可，
+		// 不要打进熔断（宁可少罚，不可误伤）。
+		return "gateway"
+	case errors.Is(err, upstream.ErrReasoningExhausted):
+		// 思考吃光额度是 max_tokens 太小，不是账号的问题。
+		return "client"
 	case errors.Is(err, pool.ErrNoAccount):
 		return "none"
 	case errors.Is(err, context.Canceled):
@@ -1063,6 +1087,12 @@ func shouldRotate(kind pool.ErrKind) bool {
 }
 
 // errorResponse 把错误映射成面向客户端的 (status, code, message)。
+// errorResponse 把错误映射成面向客户端的 (status, code, message)。
+// errorResponse 把错误映射成面向客户端的 (status, code, message)。
+//
+// 🔴 公开 message 一律是固定文案：上游原文（可能带账号、内部域名、请求 ID、
+// 半截报文）只进网关日志与面板的请求明细（requestTrace.errMsg / 账号
+// last_error）。不做「替换密钥后回显」——局部替换挡不住其它敏感字段。
 func errorResponse(err error, kind pool.ErrKind, counts pool.Counts) (int, string, string) {
 	if errors.Is(err, pool.ErrNoAccount) {
 		if counts.Total == 0 {
@@ -1071,47 +1101,63 @@ func errorResponse(err error, kind pool.ErrKind, counts pool.Counts) (int, strin
 		return http.StatusServiceUnavailable, "no_account",
 			fmt.Sprintf("没有可用账号（共 %d 个：%d 冷却中，%d 已禁用），请稍后重试或检查面板", counts.Total, counts.Cooling, counts.Disabled)
 	}
+	// 截断与思考耗尽有自己的公开语义，先于 *upstream.Error 判：它们不是
+	// 「上游回了一个错误」，而是「流本身不完整」，客户端需要能区分。
+	if errors.Is(err, upstream.ErrStreamInterrupted) {
+		return http.StatusBadGateway, "stream_interrupted",
+			"上游流在给出 finish_reason 之前结束，内容可能不完整；请重试"
+	}
+	if errors.Is(err, upstream.ErrReasoningExhausted) {
+		return http.StatusBadRequest, "reasoning_exhausted",
+			"思考耗尽输出额度：模型把 max_tokens 全用于思考，正文为空。请提高 max_tokens 后重试"
+	}
+	if errors.Is(err, upstream.ErrEmptyStream) {
+		return http.StatusBadGateway, "empty_stream", "上游没有返回任何内容，请重试"
+	}
 	var ue *upstream.Error
 	if errors.As(err, &ue) {
 		switch ue.Kind {
 		case upstream.ErrPlanLimit:
-			return http.StatusTooManyRequests, "insufficient_quota", ue.Msg
+			return http.StatusTooManyRequests, "insufficient_quota", "上游账号额度不足，请稍后重试"
 		case upstream.ErrSoftRate:
-			return http.StatusTooManyRequests, "rate_limit_exceeded", ue.Msg
+			return http.StatusTooManyRequests, "rate_limit_exceeded", "请求过于频繁，请稍后重试"
 		case upstream.ErrSessionDead:
-			return http.StatusUnauthorized, "account_session_expired", ue.Msg
+			// 不能回 401：那是「你的 API key 错了」的语义，客户端会去换 key /
+			// 重新认证，而真正要动的是网关侧的账号池。503 才会让客户端按
+			// 「服务不可用」退避重试。
+			return http.StatusServiceUnavailable, "account_session_expired", "上游账号登录态已失效，请重新登录"
 		case upstream.ErrGateway:
-			return http.StatusGatewayTimeout, "upstream_timeout", ue.Msg
+			return http.StatusGatewayTimeout, "upstream_timeout", "上游响应超时，请稍后重试"
 		case upstream.ErrBusy:
-			return http.StatusServiceUnavailable, "upstream_busy", ue.Msg
+			return http.StatusServiceUnavailable, "upstream_busy", "上游繁忙，请稍后重试"
 		case upstream.ErrClient:
+			// 上游用它自己的 4xx（偶尔是 5xx，见 Classify 的 paramErrorSignal）
+			// 表达参数错误；对客户端一律 4xx，否则客户端会按 5xx 语义无限重试。
+			// 原文里常有内部字段名/提示，不往客户端回显，看面板的请求明细。
 			status := ue.Status
-			if status < 400 || status > 599 {
+			if status < 400 || status >= 500 {
 				status = http.StatusBadRequest
 			}
-			return status, "upstream_rejected", ue.Msg
+			return status, "upstream_rejected", "上游拒绝了本次请求（参数不合法）"
 		default:
-			return http.StatusBadGateway, "upstream_error", ue.Msg
+			return http.StatusBadGateway, "upstream_error", "上游返回错误，请稍后重试"
 		}
 	}
 	var se *upstream.StreamError
 	if errors.As(err, &se) {
-		return http.StatusBadGateway, "upstream_error", se.Msg
-	}
-	if errors.Is(err, upstream.ErrEmptyStream) {
-		return http.StatusBadGateway, "empty_stream", "上游返回空内容，请重试（多次出现请检查账号状态）"
+		return http.StatusBadGateway, "upstream_error", "上游返回错误，请稍后重试"
 	}
 	switch kind {
 	case "plan_limit":
-		return http.StatusTooManyRequests, "insufficient_quota", err.Error()
+		return http.StatusTooManyRequests, "insufficient_quota", "上游账号额度不足，请稍后重试"
 	case "soft_rate":
-		return http.StatusTooManyRequests, "rate_limit_exceeded", err.Error()
+		return http.StatusTooManyRequests, "rate_limit_exceeded", "请求过于频繁，请稍后重试"
 	case "session_dead":
-		return http.StatusUnauthorized, "account_session_expired", err.Error()
+		return http.StatusServiceUnavailable, "account_session_expired", "上游账号登录态已失效，请重新登录"
 	case "gateway":
-		return http.StatusGatewayTimeout, "upstream_timeout", err.Error()
+		return http.StatusGatewayTimeout, "upstream_timeout", "上游响应超时，请稍后重试"
 	}
-	return http.StatusBadGateway, "proxy_error", err.Error()
+	return http.StatusBadGateway, "proxy_error", "网关转发失败，请稍后重试"
 }
 
 // ---------------------------------------------------------------------------
