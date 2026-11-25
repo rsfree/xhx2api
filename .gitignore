@@ -11,6 +11,9 @@ config.json
 /dist/
 *.test
 
+# 生成的图片产物（体积大、随时可再生，不该进版本库）
+generated-images/
+
 # 编辑器/系统
 .DS_Store
 .idea/

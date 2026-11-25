@@ -49,6 +49,13 @@ type Event struct {
 	Rotations    int    `json:"rotations,omitempty"`
 	ClientIP     string `json:"client_ip,omitempty"`
 	UserAgent    string `json:"user_agent,omitempty"`
+	// C2PASigner 是生图响应里 C2PA 清单的签名者（如 "OpenAI Media Service"）。
+	//
+	// 同一个模型名在上游可能落到不同厂商的后端——`raccoon-image-gen` 是
+	// LiteLLM 的 model group，实测同一分钟内就能在 Azure OpenAI 与 OpenAI
+	// 官方之间切换。不记这一列，就只能靠事后扫图猜分布；空串表示这次
+	// 响应没有任何溯源凭证，"未知"与"没有"必须分开看（沿用 UsageMissing 的教训）。
+	C2PASigner string `json:"c2pa_signer,omitempty"`
 }
 
 // ModelMetric 是按模型聚合。

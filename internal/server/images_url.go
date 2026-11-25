@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/rsfree/xhx2api/internal/upstream"
 )
 
 // 图片 URL 支持：上游只回 base64，而一张 4K 图的 base64 有 8MB+，
@@ -63,6 +65,34 @@ func imageID(blob []byte) string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// noteSigner 把这张图的 C2PA 签名者记到请求日志上。
+//
+// 一次请求可能回多张图：全部同源就记那个名字，出现第二个不同来源就记 "mixed"。
+// 不要用最后一张覆盖前面——"混合后端"恰恰是最需要被看见的那个事实。
+//
+// 没有任何清单时不写：空串本身是有意义的信息（这条路径不产出溯源凭证），
+// 与"还没解析到"混为一谈就会让面板上的比例失真。
+func noteSigner(tr *requestTrace, blob []byte) {
+	if tr == nil {
+		return
+	}
+	tr.c2pa = mergeSigner(tr.c2pa, upstream.C2PASigner(blob))
+}
+
+// mergeSigner 把新一张图的签名者并进已有结论。
+//
+// 空值只表示"这张没有凭证"，不能覆盖已知来源：一次请求里两张图，第二张无凭证
+// 就把第一张的 OpenAI 抹成空，会让面板上的"无凭证率"虚高。
+func mergeSigner(cur, next string) string {
+	if next == "" {
+		return cur
+	}
+	if cur == "" || cur == next {
+		return next
+	}
+	return "mixed"
+}
+
 // attachImageURLs 把响应里每张图落盘（或传对象存储），按 format 决定回什么：
 //
 //	url   —— 只回 url，删掉 b64_json（默认；省掉几 MB base64）
@@ -70,7 +100,7 @@ func imageID(blob []byte) string {
 //
 // 只对**真的拿到链接**的那张做处理：失败的那张保留 b64_json，客户端仍能取到图，
 // 不会因为一次落盘失败让整次生成白费。返回改写后的响应与成功拿到 url 的张数。
-func (h *Handler) attachImageURLs(r *http.Request, body []byte, format string) ([]byte, int, error) {
+func (h *Handler) attachImageURLs(r *http.Request, body []byte, format string, tr *requestTrace) ([]byte, int, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body, 0, fmt.Errorf("响应不是 JSON: %w", err)
@@ -101,6 +131,7 @@ func (h *Handler) attachImageURLs(r *http.Request, body []byte, format string) (
 			log.Printf("WARN: [images] base64 解码失败: %v", err)
 			continue
 		}
+		noteSigner(tr, blob)
 		name := imageID(blob) + ext
 		// 优先对象存储：多副本/容器部署下本地盘不共享，外链也更好用。
 		link := ""

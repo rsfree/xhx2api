@@ -256,6 +256,8 @@ type requestTrace struct {
 	total      int64
 	clientIP   string
 	userAgent  string
+	// c2pa 是生图响应的 C2PA 签名者，只有 images 协议会填（见 images_url.go）。
+	c2pa string
 }
 
 func traceFrom(ctx context.Context) *requestTrace {
@@ -275,7 +277,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		Prompt: t.prompt, Completion: t.completion, Total: t.total,
 		UsageMissing: t.usageMissing(),
 		Stream:       t.stream, Attempts: t.attempts, Rotations: t.rotations,
-		ClientIP: t.clientIP, UserAgent: t.userAgent,
+		ClientIP: t.clientIP, UserAgent: t.userAgent, C2PASigner: t.c2pa,
 	}
 }
 

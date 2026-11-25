@@ -1216,6 +1216,16 @@
   // ---------------------------------------------------------------------
   // 渲染：请求
 
+  // C2PA 签名者标签：同一个模型名在上游会在 Azure/OpenAI 之间漂移
+  // （raccoon-image-gen 是 LiteLLM model group）。面板上直接暴露「这次落到谁」，
+  // 否则只能事后扫图猜分布。空值代表这次响应没有凭证，与「未知」不是一回事。
+  function c2paTag(s) {
+    if (!s) return `<span class="muted" title="这次响应没有 C2PA 溯源凭证">—</span>`;
+    if (s === "mixed") return `<span class="tag warn" title="同一次响应里多张图来自不同后端">mixed</span>`;
+    const short = s.includes("OpenAI") ? "OpenAI" : s.includes("Microsoft") ? "Azure" : s;
+    return `<span class="tag ${short === "OpenAI" ? "blue" : ""}" title="${esc(s)}">${esc(short)}</span>`;
+  }
+
   function renderRequests() {
     const d = state.requests;
     if (!d) return;
@@ -1235,7 +1245,7 @@
     const tbody = $("#requests-table tbody");
     const events = d.events || [];
     if (!events.length) {
-      tbody.innerHTML = `<tr><td colspan="9" class="muted" style="padding:22px;text-align:center">还没有请求记录</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="10" class="muted" style="padding:22px;text-align:center">还没有请求记录</td></tr>`;
       return;
     }
     tbody.innerHTML = events.map((e) => {
@@ -1255,6 +1265,7 @@
         <td class="num">${fmtDur(e.duration_ms)}</td>
         <td class="num">${fmtDur(e.ttfb_ms)}</td>
         <td class="num">${tokens}</td>
+        <td>${c2paTag(e.c2pa_signer)}</td>
         <td>${e.error_kind ? `<span class="err-text" title="${esc(e.error || "")}">${esc(e.error_kind)}</span>` : (e.stream ? `<span class="tag">流式</span>` : "")}</td>
       </tr>`;
     }).join("");

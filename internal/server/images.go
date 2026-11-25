@@ -667,7 +667,7 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, started tim
 		body := reply.Body
 		// b64_json 时完全不碰磁盘：客户端明确要 base64，没必要为它写一份。
 		if format != "b64_json" && h.canServeURL() {
-			out, attached, uerr := h.attachImageURLs(r, body, format)
+			out, attached, uerr := h.attachImageURLs(r, body, format, tr)
 			switch {
 			case uerr != nil:
 				// 落盘失败不该让整次生成白费：图还是给客户端，只是没有 url。
