@@ -829,6 +829,12 @@ func errorText(body []byte) string {
 // ---------------------------------------------------------------------------
 // 续期
 
+// sessionCapWindow 是「续出来的票短到这个程度就等于会话到顶」的判据。
+//
+// 正常续期给 30 天；到顶时给 1~2 分钟。留 5 分钟余量既不会误判正常票，
+// 也不会被上游把残票签成「3 分钟」这种抖动漏掉。
+const sessionCapWindow = 5 * time.Minute
+
 // RefreshToken 无条件续期一次。
 func (c *Client) RefreshToken(ctx context.Context, a *auth.Auth) error {
 	_, err := c.refresh(ctx, a)
@@ -873,6 +879,26 @@ func (c *Client) refresh(ctx context.Context, a *auth.Auth) (bool, error) {
 	c.flightMu.Unlock()
 
 	token, refresh, exp, uid, err := c.refreshOnce(ctx, a)
+	if err == nil {
+		// 会话到顶：续期本身回了 200，但换回来的票只活一两分钟——exp 被钳在
+		// 上游 IAM 会话的绝对上限（实测 30 天）。2026-11-26 两个号都这样死：
+		// 09:48 续出 09:49 到期的票、12:25 续出 12:27 到期的票。
+		//
+		// 不识别它的代价很具体：请求路径按 RefreshSkew（默认 10 分钟）判临期，
+		// 而残票永远短于 skew ⇒ **每个请求都续一次**，而结果永远不变。
+		// 阈值取 5 分钟：正常续期给的是 30 天，落进来只可能是到顶残票。
+		eff := exp
+		if eff <= 0 {
+			eff = auth.JWTExpiry(token)
+		}
+		if eff > 0 && time.Until(time.UnixMilli(eff)) < sessionCapWindow {
+			a.SetTokens(token, refresh, exp)
+			a.MarkSessionCapped()
+			_ = c.persistAuth(a)
+			err = &Error{Kind: ErrSessionDead, Status: 401,
+				Msg: "小浣熊会话已到上限（IAM 会话约 30 天，续期不会延长），请重新登录或从官方客户端同步该账号"}
+		}
+	}
 	flight.token, flight.exp, flight.uid, flight.err = token, exp, uid, err
 	close(flight.done)
 	c.flightMu.Lock()
@@ -920,7 +946,7 @@ func (c *Client) refreshOnce(ctx context.Context, a *auth.Auth) (token, refresh 
 		return "", "", 0, "", err
 	}
 	if resp.Status == 401 || resp.Status == 403 {
-		return "", "", 0, "", &Error{Kind: ErrSessionDead, Status: 401, Msg: "小浣熊刷新令牌已失效，请重新登录该账号"}
+		return "", "", 0, "", &Error{Kind: ErrSessionDead, Status: 401, Msg: "小浣熊续期被上游拒绝（IAM 会话已到期或 refresh_token 过期），请重新登录或从官方客户端同步该账号"}
 	}
 	data, err := payloadOf(resp, "凭证续期")
 	if err != nil {

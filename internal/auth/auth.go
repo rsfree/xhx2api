@@ -97,6 +97,16 @@ type Data struct {
 	// DeviceCheckedAt 是上一次查 DeviceBound 的时刻（RFC3339），用于 TTL 复用，
 	// 免得每轮签到都对每个号打一次 user_info。
 	DeviceCheckedAt string `json:"device_checked_at,omitempty"`
+
+	// SessionCapped 标记「上游 IAM 会话已到绝对上限」。
+	//
+	// 为什么要单独记：到期前续期**不会报错**，只会续出一张只活 1~2 分钟的票
+	// （exp 被钳在会话上限）。请求路径按 RefreshSkew 判断临期，于是一个本该
+	// 「停机」的账号会变成「每个请求都续一次、永远续不好」的续期风暴。
+	// 实测 2026-11-26：7772869 在 09:48 续出 09:49 到期的票，7774611 在
+	// 12:25 续出 12:27 到期的票——两张票的 exp 正好是各自 30 天会话的终点。
+	// 打上这个标记后不再尝试续期，直接按登录态失效处理，等重新登录清掉。
+	SessionCapped bool `json:"session_capped,omitempty"`
 }
 
 // Auth 是归一化后的账号凭证。
@@ -143,12 +153,44 @@ func (a *Auth) Realm() string { return RealmCN }
 // CanRefresh 报告是否有刷新凭证。
 func (a *Auth) CanRefresh() bool { return a.RefreshTokenValue() != "" }
 
+// SessionCappedValue 报告会话是否已到上游的绝对上限。
+func (a *Auth) SessionCappedValue() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.SessionCapped
+}
+
+// MarkSessionCapped 打上「会话到顶」标记：此后不再续期，直到换到一张健康的新票。
+func (a *Auth) MarkSessionCapped() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.SessionCapped = true
+}
+
+// sessionCapRecover 是「新票够健康、可以解除到顶标记」的门槛。
+//
+// 取 10 分钟而非「大于 0」：续期在到顶那一刻返回的票正好是 1~2 分钟的，
+// 用它当判据会把到顶状态的解除条件设在「刚好续了一次」上，标记就白打了。
+const sessionCapRecover = 10 * time.Minute
+
 // NeedsRefresh 报告 token 是否将在 within 内过期。
 //
 // 无 expiry（=0）时返回 false：上游没告诉我们到期时间就等 401 兜底，
 // 否则每个请求前都会白打一次续期。
+//
+// 会话到顶时恒为 false：那种状态下的续期换回来的票永远比 skew 短，
+// 判定「临期」只会让每个请求都去续一次，而结果不会变好。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
-	exp := a.ExpiresAtValue()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.needsRefreshLocked(within)
+}
+
+func (a *Auth) needsRefreshLocked(within time.Duration) bool {
+	if a.SessionCapped {
+		return false
+	}
+	exp := a.ExpiresAt
 	if exp <= 0 {
 		return false
 	}
@@ -158,17 +200,16 @@ func (a *Auth) NeedsRefresh(within time.Duration) bool {
 // NeedsRefreshLocked 在已持写锁时判断（避免续期路径自己再 RLock 造成重入死锁——
 // Go 的 RWMutex 不可重入，读锁套写锁会直接卡死）。
 func (a *Auth) NeedsRefreshLocked(within time.Duration) bool {
-	if a.ExpiresAt <= 0 {
-		return false
-	}
-	return time.Now().Add(within).UnixMilli() >= a.ExpiresAt
+	return a.needsRefreshLocked(within)
 }
 
 // SetTokens 写入续期得到的新票。
 //
-// 两个约定：
+// 三个约定：
 //   - refresh 为空 = 上游没有轮换，保留旧值（宁可留着旧票也别把唯一的续期凭证抹掉）；
-//   - expiresAtMs<=0 = 上游没给，用新 access token 的 JWT exp 兜底。
+//   - expiresAtMs<=0 = 上游没给，用新 access token 的 JWT exp 兜底；
+//   - 新票明显长于「到顶时那种一两分钟的残票」时解除 SessionCapped：
+//     换到健康的新票（重新登录/导入）就是到顶状态唯一的出路。
 func (a *Auth) SetTokens(access, refresh string, expiresAtMs int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -182,6 +223,9 @@ func (a *Auth) SetTokens(access, refresh string, expiresAtMs int64) {
 		a.ExpiresAt = normalizeMillis(expiresAtMs)
 	} else if exp := JWTExpiry(a.AccessToken); exp > 0 {
 		a.ExpiresAt = exp
+	}
+	if a.SessionCapped && a.ExpiresAt > time.Now().Add(sessionCapRecover).UnixMilli() {
+		a.SessionCapped = false
 	}
 }
 

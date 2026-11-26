@@ -655,3 +655,50 @@ func TestClampImageSizeNeverExceedsEdge(t *testing.T) {
 		}
 	}
 }
+
+// TestRefreshMarksSessionCappedWhenTokenBarelyExtends 锁定「会话到顶」的识别。
+//
+// 上游到期前续期**不报错**，只回一张活一两分钟的票（exp 被钳在 IAM 会话上限）。
+// 不识别它，请求路径就会按 RefreshSkew（默认 10 分钟）把这张残票判成「临期」，
+// 于是每个请求都去续一次、永远续不好。2026-11-26 两个号正是这样死的：
+// 7772869 在 09:48 续出 09:49 到期的票，7774611 在 12:25 续出 12:27 到期的票，
+// 两个时刻都正好是各自 30 天会话的终点。
+func TestRefreshMarksSessionCappedWhenTokenBarelyExtends(t *testing.T) {
+	soon := time.Now().Add(90 * time.Second).UnixMilli()
+	c, _ := fakeUpstream(t, map[string]http.HandlerFunc{
+		"/auth/refresh": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, `{"code":0,"data":{"access_token":"cap-token","refresh_token":"cap-refresh","expires_at":%d}}`, soon)
+		},
+	})
+	a := &auth.Auth{Data: auth.Data{UID: "u", AccessToken: "old", RefreshToken: "ref"}}
+	if err := c.RefreshToken(context.Background(), a); err == nil {
+		t.Fatal("续出 90 秒的票必须判成会话到顶，实际没有报错")
+	}
+	if !a.SessionCappedValue() {
+		t.Fatal("没有打上 SessionCapped 标记")
+	}
+	if a.NeedsRefresh(10*time.Minute) || a.NeedsRefresh(time.Hour) {
+		t.Fatal("到顶后任何窗口都不该再判临期：否则每个请求都会重续一次")
+	}
+}
+
+// TestSetTokensClearsSessionCappedOnHealthyToken 换到健康新票要解除到顶标记。
+func TestSetTokensClearsSessionCappedOnHealthyToken(t *testing.T) {
+	a := &auth.Auth{Data: auth.Data{UID: "u"}}
+	a.MarkSessionCapped()
+	a.SetTokens("t", "r", time.Now().Add(48*time.Hour).UnixMilli())
+	if a.SessionCappedValue() {
+		t.Fatal("新票还有 48 小时，到顶标记应当解除")
+	}
+}
+
+// TestSetTokensKeepsSessionCappedOnStubToken 到顶那一刻的残票不能解除标记：
+// 否则刚打完标记就被自己的残票解掉，等于没打。
+func TestSetTokensKeepsSessionCappedOnStubToken(t *testing.T) {
+	a := &auth.Auth{Data: auth.Data{UID: "u"}}
+	a.MarkSessionCapped()
+	a.SetTokens("t", "r", time.Now().Add(time.Minute).UnixMilli())
+	if !a.SessionCappedValue() {
+		t.Fatal("1 分钟的残票不该被当成健康新票")
+	}
+}
