@@ -121,8 +121,10 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.MaxRotate <= 0 {
 		cfg.MaxRotate = 3
 	}
+	// 默认 6h：与调度器保活同口径。旧的 10 分钟窗口对 30 天寿命的票
+	// 等于永不触发，而请求路径是 token 失效前的最后兜底。
 	if cfg.RefreshSkew <= 0 {
-		cfg.RefreshSkew = 10 * time.Minute
+		cfg.RefreshSkew = 6 * time.Hour
 	}
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = 32 << 20

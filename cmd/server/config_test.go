@@ -72,9 +72,39 @@ func TestDefaults(t *testing.T) {
 	if cfg.upstreamShort != 120*time.Second {
 		t.Fatalf("upstream short = %v", cfg.upstreamShort)
 	}
+	// 保活必须每小时检查：窗口 6h，一天查一次会漏掉大部分临期 token。
+	if len(cfg.Schedule.KeepaliveHours) != 24 {
+		t.Fatalf("默认保活小时应为 0-23，得到 %v", cfg.Schedule.KeepaliveHours)
+	}
+	// 请求路径的续期窗口与保活同口径。
+	if cfg.Server.RefreshSkewSeconds != 21600 {
+		t.Fatalf("默认续期窗口 = %d 秒", cfg.Server.RefreshSkewSeconds)
+	}
 	// 别名表要能让 gpt-4o 落到上游模型。
 	if cfg.Aliases["gpt-4o"] != "raccoon-chat-ml-5-5" {
 		t.Fatalf("别名表不对: %v", cfg.Aliases)
+	}
+}
+
+// TestParseConfigMigratesLegacyKeepaliveHours 老配置里写死的 [3] 必须自动升级。
+//
+// [3] 是历史默认值（每天只检查一次），配上 6h 续期窗口必然漏判；升级后
+// 老实例不改配置也能恢复覆盖。用户自己填的组合（如 [3,15]）不能被吞掉。
+func TestParseConfigMigratesLegacyKeepaliveHours(t *testing.T) {
+	cfg, err := ParseConfig([]byte(`{"schedule":{"keepalive_hours":[3]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Schedule.KeepaliveHours) != 24 {
+		t.Fatalf("旧默认 [3] 应迁移成每小时检查，得到 %v", cfg.Schedule.KeepaliveHours)
+	}
+
+	cfg, err = ParseConfig([]byte(`{"schedule":{"keepalive_hours":[3,15]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Schedule.KeepaliveHours) != 2 || cfg.Schedule.KeepaliveHours[0] != 3 || cfg.Schedule.KeepaliveHours[1] != 15 {
+		t.Fatalf("自定义小时被改写: %v", cfg.Schedule.KeepaliveHours)
 	}
 }
 

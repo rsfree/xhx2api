@@ -271,7 +271,8 @@ wire_api = "responses"
 | `pool.queue_wait` | `2s` | 全部账号在途满时的最长等待；超时软回退（多排一个）。`0` = 不等待 |
 | `pool.breaker_*` / `degrade_*` | `3 次 / 10m` | 熔断与降权阈值 |
 | `schedule.checkin_hours` | `[9]` | 每日签到时点（东八区） |
-| `schedule.keepalive_hours` | `[3]` | token 保活时点 |
+| `schedule.keepalive_hours` | `0-23`（每小时） | token 保活检查的小时。续期窗口 6h，**检查间隔必须 ≤ 窗口**——收窄成每天一次会漏掉大部分临期号（2026-11-26 线上实证：两个带 refresh_token 的号在 03:00 检查时剩 6.8h / 9.4h 被判「还早」，下一次检查已过期） |
+| `server.refresh_skew_seconds` | `21600`（6h） | 请求路径上「临期多久前主动续期」的窗口，与保活同口径。旧默认 10 分钟对 30 天寿命的票等于不触发 |
 | `schedule.balance_refresh_minutes` | `5` | 余额刷新周期（0 = 关闭） |
 | `schedule.include_disabled_in_tasks` | `false` | 已禁用账号是否也签到/续期 |
 | `session_sticky.*` | `true` / `30m` | 会话粘性：客户端给了 `X-Session-Id` / `prompt_cache_key` 时同一对话尽量同号 |

@@ -149,6 +149,12 @@ type Config struct {
 
 	Server struct {
 		ReadTimeout string `json:"read_timeout"`
+		// RefreshSkewSeconds 是请求路径上「临期多久前主动续期」的窗口（默认 6h）。
+		//
+		// 旧默认 10 分钟对 30 天寿命的票等于不触发（命中率 1/4320），而请求
+		// 路径本就是 token 失效前的最后一道兜底；窗口与调度器保活统一成 6h，
+		// 两处口径才不会互相打脸。
+		RefreshSkewSeconds int `json:"refresh_skew_seconds"`
 		// MinOutputTokens 出站 max_tokens 下限（默认 2048，负数 = 不抬升）。
 		// 上游的思考 token 算在 max_tokens 里：客户端给 16/512 时思考会把预算
 		// 吃光、正文为空（真号实测）。不想改客户端意图的可以设 0 关掉。
@@ -334,7 +340,9 @@ func defaults() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5
 	c.Schedule.CheckinHours = []int{9}
-	c.Schedule.KeepaliveHours = []int{3}
+	// 保活必须每小时检查：续期窗口 6h，一天只查一次会漏掉 75% 的临期号
+	// （2026-11-26 线上实证）。收窄小时等于主动放弃覆盖。
+	c.Schedule.KeepaliveHours = allDayHours()
 	c.Schedule.CheckinEnabled = true
 	c.Schedule.KeepaliveEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
@@ -350,11 +358,37 @@ func defaults() *Config {
 	c.Logging.RequestArchiveMaxMB = 100
 	c.Logging.RequestClientInfo = true
 	c.Server.ReadTimeout = "300s"
+	c.Server.RefreshSkewSeconds = 21600
 	c.Panel.Title = "小浣熊网关"
 	c.Login.Enabled = true
 	c.Login.AppName = "办公小浣熊客户端"
 	c.ShutdownTimeoutSeconds = 10
 	return c
+}
+
+// allDayHours 返回 0-23 全部小时。
+//
+// 保活的不变式是「检查间隔 ≤ 续期窗口」：窗口 6h，间隔就必须是小时级，
+// 否则 token 会在两次检查之间无声过期（2026-11-26 线上实证）。
+func allDayHours() []int {
+	hours := make([]int, 24)
+	for i := range hours {
+		hours[i] = i
+	}
+	return hours
+}
+
+// hoursEqual 判断两个小时列表是否逐项相同（顺序敏感）。
+func hoursEqual(got, want []int) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Load 读取并校验配置文件；不存在时返回 fs.ErrNotExist 供 main 决定是否自动生成。
@@ -620,6 +654,15 @@ func applyDefaults(c *Config) {
 	if len(c.Schedule.KeepaliveHours) == 0 {
 		c.Schedule.KeepaliveHours = d.Schedule.KeepaliveHours
 	}
+	// keepalive_hours 的旧默认是 [3]（一天只检查一次）。续期窗口只有 6 小时，
+	// 24 小时间隔必然漏判：2026-11-26 线上两个带 refresh_token 的号在
+	// 03:00 检查时剩 6.8h / 9.4h，双双被判「还早」，下一次检查已过期。
+	// 恰好等于旧默认的配置视为「从未改过」，按每小时检查处理；自定义列表
+	// （如 [3,15]）原样保留。
+	if hoursEqual(c.Schedule.KeepaliveHours, []int{3}) {
+		log.Printf("WARN: schedule.keepalive_hours=[3] 是旧默认值（每天只检查一次，会漏掉临期 token），已按每小时检查处理")
+		c.Schedule.KeepaliveHours = allDayHours()
+	}
 	if c.Schedule.BalanceRefreshMinutes <= 0 {
 		c.Schedule.BalanceRefreshMinutes = d.Schedule.BalanceRefreshMinutes
 	}
@@ -643,6 +686,9 @@ func applyDefaults(c *Config) {
 	}
 	if c.Server.ReadTimeout == "" {
 		c.Server.ReadTimeout = d.Server.ReadTimeout
+	}
+	if c.Server.RefreshSkewSeconds <= 0 {
+		c.Server.RefreshSkewSeconds = d.Server.RefreshSkewSeconds
 	}
 	if c.Server.MinOutputTokens == 0 {
 		c.Server.MinOutputTokens = 2048

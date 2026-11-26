@@ -264,6 +264,7 @@ func main() {
 		ImageDir:              imageDirOf(cfg),
 		ImageUploader:         imageUploader,
 		QueueWait:             cfg.queueWait,
+		RefreshSkew:           time.Duration(cfg.Server.RefreshSkewSeconds) * time.Second,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

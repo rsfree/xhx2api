@@ -714,7 +714,7 @@
       // 说清楚「签到」到底做什么：它不是发分入口（grant 恒幂等空操作），
       // 而是观测当天有没有 daily_grant 到账。不写这句会被当成「点了就该加分」。
       ["签到做什么", "观测当日 daily_grant 是否到账（发放由上游按天触发，时点不固定）"],
-      ["保活时点", (cfg.KeepaliveHours || []).map((h) => h + ":00").join(" / ") + (cfg.KeepaliveEnabled ? "" : "（已关闭）")],
+      ["保活时点", ((cfg.KeepaliveHours || []).length >= 24 ? "每小时" : (cfg.KeepaliveHours || []).map((h) => h + ":00").join(" / ")) + (cfg.KeepaliveEnabled ? "" : "（已关闭）")],
       ["余额刷新", (cfg.BalanceRefreshMinutes || 0) + " 分钟一次"],
       ["含已禁用账号", cfg.IncludeDisabled ? "是" : "否"],
       ["新号静默期", (cfg.NewAccountGraceDays || 0) + " 天"],
@@ -973,7 +973,7 @@
         { path: "schedule.keepalive_enabled", label: "开启保活", type: "bool" },
         { path: "schedule.balance_refresh_enabled", label: "定时刷余额", type: "bool" },
         { path: "schedule.checkin_hours", label: "签到小时", type: "list", hint: "逗号分隔，如 9" },
-        { path: "schedule.keepalive_hours", label: "保活小时", type: "list", hint: "逗号分隔，如 3,15" },
+        { path: "schedule.keepalive_hours", label: "保活小时", type: "list", hint: "默认 0-23 每小时检查一次；间隔必须小于 6h 续期窗口，收窄会漏号" },
         { path: "schedule.concurrency", label: "任务并发", type: "number" },
         { path: "schedule.balance_refresh_minutes", label: "刷余额间隔（分钟）", type: "number" },
         { path: "schedule.new_account_grace_days", label: "新号静默期（天）", type: "number" },

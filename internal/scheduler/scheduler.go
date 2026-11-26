@@ -102,7 +102,7 @@ func normalize(cfg Config) Config {
 		cfg.CheckinHours = []int{9}
 	}
 	if len(cfg.KeepaliveHours) == 0 {
-		cfg.KeepaliveHours = []int{3}
+		cfg.KeepaliveHours = allDayHours()
 	}
 	if cfg.BalanceRefreshMinutes <= 0 {
 		cfg.BalanceRefreshMinutes = 5
@@ -175,6 +175,15 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context) {
 			s.RefreshBalances(ctx)
 		}
 	}
+}
+
+// allDayHours 返回 0-23 全部小时（保活的默认检查范围）。
+func allDayHours() []int {
+	hours := make([]int, 24)
+	for i := range hours {
+		hours[i] = i
+	}
+	return hours
 }
 
 // runDueJobs 检查当前时点该跑哪些任务。
@@ -527,7 +536,8 @@ func (s *Scheduler) keepaliveAll(ctx context.Context) JobResult {
 			result.Skipped++
 			continue
 		}
-		// 保活窗口放宽到 6 小时：比请求路径的 10 分钟激进得多，避免每次请求都要刷。
+		// 窗口 6h，而调度按小时检查（见 runDueJobs）：窗口必须大于间隔，
+		// 否则 token 会在两次检查之间过期。旧配置一天只查一次，等于 75% 漏判。
 		refreshed, err := s.up.RefreshTokenIfNeeded(ctx, a, 6*time.Hour)
 		if err != nil {
 			result.Failed++
