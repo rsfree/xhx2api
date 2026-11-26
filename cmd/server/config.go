@@ -255,6 +255,35 @@ type Config struct {
 		// gpt-image-1 / dall-e-3 的客户端能直接选中并出图，而不是 400。
 		// 省略该字段 = 用默认表；显式 [] = 一个别名都不暴露。
 		Aliases []string `json:"aliases"`
+		// GenerationsAcceptsImage 让 /v1/images/generations 也接受 image（默认 false）。
+		//
+		// false = 严格按 OpenAI：generations 只做文生图，带 image 会 400 并指向
+		// /v1/images/edits。这不是洁癖——上游 /images/gen 收到 image 会**静默忽略**
+		// 并出一张无关新图（见 upstream/images.go 实测），网关替它转 edits 是一种
+		// 只有本网关知道的扩展：客户端以为自己走的是标准路径，语义却变了。
+		//
+		// true = 兼容旧用法（有 image 就转 edits）。
+		GenerationsAcceptsImage bool `json:"generations_accepts_image"`
+		// URLInput 控制 image/mask 是否接受 http(s) 引用（省略 = 允许）。
+		//
+		// 图像协议的合法载体是 URL / data URI / 裸 base64 三种；拒收 URL 会让
+		// 「拿上一张图的 url 继续改」这条最自然的用法直接 400。
+		//
+		// 收下 URL 意味着网关要替调用方发一次网络请求，所以放行的是**载体**，
+		// 不是信任：每个地址都要过 SSRF 守卫（环回 / 私网 / 链路本地 / 云元数据
+		// / 组播 / 保留段一律拒），那道守卫没有开关，也没有配置项能绕过它。
+		URLInput *bool `json:"url_input"`
+		// URLFetchTimeoutSeconds 是一批 URL 垫图下载的总预算（省略 = 30 秒）。
+		//
+		// 是**整批**的预算，不是单张：并行下载 16 张时，单张各自有更短的
+		// 连接/响应头超时，总预算只负责让请求在最坏情况下也能按时失败。
+		URLFetchTimeoutSeconds int `json:"url_fetch_timeout_seconds"`
+		// URLFetchAllowHosts 是图源域名白名单（省略 = 不限域名，只过 IP 守卫）。
+		//
+		// IP 守卫挡的是「内网」，白名单挡的是「公网上的谁」：企业环境常只需要
+		// 允许自家对象存储。按标签边界做后缀匹配，cdn.example.com 不会放行
+		// evilcdn.example.com。
+		URLFetchAllowHosts []string `json:"url_fetch_allow_hosts"`
 	} `json:"images"`
 
 	Models struct {
@@ -716,6 +745,9 @@ func (c *Config) validate() error {
 	if c.Images.MaxTotalMB != nil && *c.Images.MaxTotalMB < 0 {
 		return fmt.Errorf("images.max_total_mb 不能为负（0 = 不限制）")
 	}
+	if c.Images.URLFetchTimeoutSeconds < 0 {
+		return fmt.Errorf("images.url_fetch_timeout_seconds 不能为负（0 = 默认 30 秒）")
+	}
 
 	if !strings.Contains(c.Listen, ":") {
 		return fmt.Errorf("listen 必须是 host:port 形式（当前 %q）", c.Listen)
@@ -826,6 +858,23 @@ func (c *Config) ImageMaxTotalMB() int {
 		return *c.Images.MaxTotalMB
 	}
 	return 0
+}
+
+// ImageURLInputEnabled 表示 image/mask 是否接受 http(s) 引用（默认开）。
+//
+// 三态 bool：省略 = 开，显式 false = 关。用「允许」而不是「禁用」命名在这里
+// 是因为配置面要对用户表达正语义；注入 handler 时再翻成 DisableImageURLInput，
+// 让 handler 的零值保持正确行为。
+func (c *Config) ImageURLInputEnabled() bool {
+	return c.Images.URLInput == nil || *c.Images.URLInput
+}
+
+// ImageURLFetchTimeout 取 URL 垫图的总预算（0 = 由 server 包用默认 30s）。
+func (c *Config) ImageURLFetchTimeout() time.Duration {
+	if c.Images.URLFetchTimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.Images.URLFetchTimeoutSeconds) * time.Second
 }
 
 func (c *Config) computeDerived() {
@@ -1008,6 +1057,13 @@ func changedRestartFields(oldCfg, newCfg *Config) []string {
 		{"images.max_total_mb", itoa(oldCfg.ImageMaxTotalMB()), itoa(newCfg.ImageMaxTotalMB())},
 		{"images.dir", oldCfg.Images.Dir, newCfg.Images.Dir},
 		{"images.public_base", oldCfg.Images.PublicBase, newCfg.Images.PublicBase},
+		// 端点分工与 URL 载体都是启动时注入 handler 的，改完要重启才生效。
+		{"images.generations_accepts_image", boolStr(oldCfg.Images.GenerationsAcceptsImage), boolStr(newCfg.Images.GenerationsAcceptsImage)},
+		{"images.url_input", optionalBool(oldCfg.Images.URLInput), optionalBool(newCfg.Images.URLInput)},
+		{"images.url_fetch_timeout_seconds", itoa(oldCfg.Images.URLFetchTimeoutSeconds), itoa(newCfg.Images.URLFetchTimeoutSeconds)},
+		{"images.url_fetch_allow_hosts",
+			strings.Join(oldCfg.Images.URLFetchAllowHosts, ","),
+			strings.Join(newCfg.Images.URLFetchAllowHosts, ",")},
 	}
 	changed := map[string]bool{}
 	for _, v := range values {
@@ -1149,6 +1205,9 @@ func restartRequiredFields(c *Config) []string {
 		// 下面几个都是启动时注入 handler 的（url 能力、默认形态、落盘目录、对外基址）。
 		"images.return_url", "images.response_format", "images.max_total_mb",
 		"images.dir", "images.public_base",
+		// 端点分工与 URL 垫图的开关、预算、白名单同样是启动时注入的。
+		"images.generations_accepts_image",
+		"images.url_input", "images.url_fetch_timeout_seconds", "images.url_fetch_allow_hosts",
 	}
 }
 

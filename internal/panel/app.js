@@ -849,7 +849,9 @@
       + "（省略 size 时上游给 1254×1254 而不是 1024，quality 默认 low）。"
       + "尺寸有两条上限——最长边 ≤3840、总像素 ≤3840×2160（方形最多 2880×2880），超了网关自动等比压，"
       + "并在响应头 X-XHX-Image-Size 标注实际提交的尺寸。"
-      + "单账号并发上限 10（与对话共用），超出会 429，网关会自动等 2 秒原地重试。";
+      + "单账号并发上限 10（与对话共用），超出会 429，网关会自动等 2 秒原地重试。"
+      + "垫图（image/mask）收三种载体：http(s) URL、data URI、裸 base64；"
+      + "一次最多 16 张，单张 20MB、合计 48MB。";
 
     const grid = $("#models-grid");
     let html = list.map(modelCard).join("");
@@ -888,7 +890,8 @@
             <button class="mc-title" data-copy="${esc(main)}" title="点击复制模型 ID">${esc(main)}</button>
             <div class="mc-price"><span class="tag ok">生图</span></div>
           </div>
-          <div class="mc-desc">文生图 / 图生图通道：<code>POST /v1/images/generations</code>，
+          <div class="mc-desc">文生图 <code>POST /v1/images/generations</code>；图生图 <code>POST /v1/images/edits</code>
+            （<code>image</code> 收 URL / data URI / 裸 base64，指向本网关 <code>/v1/images/&lt;id&gt;</code> 的链接直接读盘）。
             默认返回 <code>url</code>（不传 response_format 就是 url；要 base64 传 <code>b64_json</code>）。
             实测 20-200s，不扣积分（不保证长期）。
             上游只有这一个模型组——<b>model 字段不参与路由</b>，真正生效的是 size 与 quality。</div>
@@ -1060,6 +1063,27 @@
         {
           path: "images.max_total_mb", label: "图片目录上限（MB）", type: "number", restart: true, omitIfEmpty: true,
           hint: "默认 2048，0 = 不限制。超限按修改时间删最旧的（旧链接会 404）",
+        },
+        {
+          path: "images.generations_accepts_image", label: "generations 也收图", type: "bool", restart: true,
+          hint: "默认关：按 OpenAI，/v1/images/generations 只做文生图，带 image 会 400 并指向 /v1/images/edits。"
+            + "打开则兼容老用法（有图自动转图生图）",
+        },
+        {
+          path: "images.url_input", label: "接受 URL 垫图", type: "bool", defaultTrue: true, restart: true,
+          hint: "默认开：image/mask 可传 http(s) 链接。指向本网关 /v1/images/<id> 的直接读盘、不发网络请求；"
+            + "其余地址要过 SSRF 守卫——环回 / 私网 / 链路本地 / 云元数据 / 组播一律拒绝，这道守卫没有开关",
+        },
+        {
+          path: "images.url_fetch_timeout_seconds", label: "URL 垫图下载预算（秒）", type: "number", restart: true, omitIfEmpty: true,
+          hint: "一批图共享的总预算，默认 30；单张连接 5s、响应头 10s。只在 url_input 开着时有意义",
+        },
+        {
+          // 这里**不能**用 omitIfEmpty：留空是「取消白名单」这条意图，
+          // 不下发就会 merge 回旧白名单，用户删了保存又冒出来。
+          // 空数组下发后按集合段整段替换，正好等于「不限域名」。
+          path: "images.url_fetch_allow_hosts", label: "图源域名白名单", type: "lines", wide: true,
+          hint: "一行一个域名，留空 = 不限域名（只过 IP 守卫）。按标签边界匹配：cdn.example.com 不会放行 evilcdn.example.com",
         },
       ],
     },

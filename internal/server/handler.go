@@ -105,6 +105,32 @@ type Config struct {
 	//
 	// 实测 20-200s，比对话慢一个数量级；给 5 分钟是为了覆盖高分辨率档位。
 	ImageTimeout time.Duration
+	// DisableImageURLInput 关掉 image/mask 的 http(s) URL 载体（零值 = 允许）。
+	//
+	// 用「禁用」而不是「启用」，理由同 ExcludeUpstreamHidden：零值要是正确行为。
+	// 注意它关的是**载体**，不是 SSRF 守卫——守卫没有开关，任何 URL 都要过。
+	DisableImageURLInput bool
+	// ImageGenerationsAcceptsImage 让 /v1/images/generations 也收 image（零值 = 不收）。
+	//
+	// 零值必须是「不收」：OpenAI 的 generations 参数表里没有 image，图生图是
+	// /v1/images/edits 的职责。零值=true 会让默认行为偏离它声称兼容的契约。
+	// 打开它是为了老的「把图塞给 generations」用法，此时网关按「有图转 edits」处理。
+	ImageGenerationsAcceptsImage bool
+	// ImageURLFetchTimeout 是一批 URL 垫图下载的总预算（0 = 30s）。
+	//
+	// 不是单张：16 张并行、每张都可能卡满单张超时，没有总预算时请求会被
+	// 拖到调用方先放弃。
+	ImageURLFetchTimeout time.Duration
+	// ImageURLFetchAllowHosts 是图源域名白名单（空 = 不限，只过 IP 守卫）。
+	//
+	// IP 守卫挡的是「内网」，白名单挡的是「公网上的谁」：企业环境里往往只想
+	// 允许自家对象存储，这一条是唯一能表达它的地方。
+	ImageURLFetchAllowHosts []string
+	// imageFetchTransport 只给同包测试注入（httptest 监听 127.0.0.1，会被
+	// IP 守卫拦掉，需要一条能连本机的通道验证下载逻辑）。
+	//
+	// 未导出 = 配置与外部包都触达不到；生产永远 nil，走 images_fetch.go 的守卫。
+	imageFetchTransport http.RoundTripper
 	// MinOutputTokens 出站 max_tokens 下限（0 = 不抬升；默认 1024）。
 	// 思考 token 算在 max_tokens 里，客户端给 16/512 会被思考吃光、正文回空。
 	MinOutputTokens int
@@ -798,7 +824,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 登录态失效先试着续期，续上了就**不罚号**：401 往往只是 token 恰好
 			// 过期，账号本身完全正常。先罚 2 分钟冷却再去续期，会让这个号在
 			// 冷却窗口内不可用（实测踩过：单号部署直接 503）。
-			if kind == "session_dead" && a.CanRefresh() {
+			//
+			// 会话到顶（续期只能续出残票）时不再重试：那种状态续一万次也回不来，
+			// 多打一次只是给上游多一条 401 记录，还拖慢这次请求。
+			if kind == "session_dead" && a.CanRefresh() && !a.SessionCappedValue() {
 				if rerr := h.cfg.Upstream.RefreshToken(r.Context(), a); rerr == nil {
 					lease.ReleaseSuccess(latency)
 					lastErr = cerr

@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -47,12 +49,15 @@ type testEnv struct {
 	// 「瞬时过载原地重试」。
 	imageRateLimit int
 	// 图生图（/images/edits）的观测点：上游收到的是不是 multipart、有没有 image 文件。
-	editHits      atomic.Int64
-	editCType     string
-	editPrompt    string
-	editHasFile   bool
-	editHasModel  bool
-	editFileCount int
+	editHits   atomic.Int64
+	editCType  string
+	editPrompt string
+	// editFailMessage 非空时让假上游的 /images/edits 回 500 + 这段文案，
+	// 用来验证「上游原文不进公开错误体」。
+	editFailMessage string
+	editHasFile     bool
+	editHasModel    bool
+	editFileCount   int
 	// reqLog 是请求账本：断言「用量缺失」这类只体现在记账里的行为。
 	reqLog *reqlog.Recorder
 }
@@ -118,7 +123,13 @@ func setupEnv(t *testing.T, fakeHandler http.HandlerFunc, uids ...string) *testE
 		env.editHits.Add(1)
 		env.imageMu.Lock()
 		env.editCType = r.Header.Get("Content-Type")
+		failMsg := env.editFailMessage
 		env.imageMu.Unlock()
+		if failMsg != "" {
+			writeJSON(w, 500, map[string]any{"error": map[string]any{
+				"code": "500", "message": failMsg}})
+			return
+		}
 		if err := r.ParseMultipartForm(8 << 20); err != nil {
 			writeJSON(w, 415, map[string]any{"error": map[string]any{
 				"code": "unsupported_media_type_error", "message": "only multipart/form-data is supported"}})
@@ -2041,11 +2052,11 @@ func TestSweepImageDir(t *testing.T) {
 // ---------------------------------------------------------------------------
 // image 字段的三种写法：字符串 / 数组 / 裸 base64
 
-// TestGenerationsAcceptsBareBase64Array 守「数组 + 裸 base64」：
+// TestEditsAcceptsBareBase64Array 守「数组 + 裸 base64」：
 // 不带 data: 前缀也要认（很多客户端只发 base64 本体）。
-func TestGenerationsAcceptsBareBase64Array(t *testing.T) {
+func TestEditsAcceptsBareBase64Array(t *testing.T) {
 	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
-	resp, body := postImage(t, env.gateway.URL, map[string]any{
+	resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
 		"prompt": "合成一张海报",
 		"image":  []any{pngB64("a"), pngB64("b")},
 	})
@@ -2060,10 +2071,10 @@ func TestGenerationsAcceptsBareBase64Array(t *testing.T) {
 	}
 }
 
-// TestGenerationsAcceptsSingleBase64String 守「字符串 + 裸 base64」。
-func TestGenerationsAcceptsSingleBase64String(t *testing.T) {
+// TestEditsAcceptsSingleBase64String 守「字符串 + 裸 base64」。
+func TestEditsAcceptsSingleBase64String(t *testing.T) {
 	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
-	resp, body := postImage(t, env.gateway.URL, map[string]any{
+	resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
 		"prompt": "把背景换成雪山",
 		"image":  pngB64("only"),
 	})
@@ -2081,9 +2092,9 @@ func TestGenerationsAcceptsSingleBase64String(t *testing.T) {
 
 // TestGenerationsRejectsNonStringImageElement 守数组元素类型：
 // 非字符串（数字/对象/嵌套数组）要明确报错，而不是静默丢掉一张图。
-func TestGenerationsRejectsNonStringImageElement(t *testing.T) {
+func TestEditsRejectsNonStringImageElement(t *testing.T) {
 	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
-	resp, body := postImage(t, env.gateway.URL, map[string]any{
+	resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
 		"prompt": "cat",
 		"image":  []any{pngB64("a"), 42},
 	})
@@ -2335,12 +2346,17 @@ func pngB64(tag string) string {
 	return base64.StdEncoding.EncodeToString([]byte("\x89PNG\r\n\x1a\n" + tag))
 }
 
-// TestGenerationsWithImageRoutesToEdits 守「generations 也能图生图」。
+// TestGenerationsWithImageRoutesToEdits 守**兼容开关**下的路由。
+//
+// 默认行为已改成「generations 带图 400 并指向 edits」（见
+// TestGenerationsRejectsImagePointsToEdits）；这里守打开
+// images.generations_accepts_image 之后，老的「有图就转 edits」仍然可用。
 //
 // 上游 /images/gen 收到 image 会静默忽略（实测 image_tokens=0、出无关新图），
-// 所以网关必须自己分流到 /images/edits，不能透传后假装支持。
+// 所以走这条兼容路径时网关必须自己分流到 /images/edits，不能透传后假装支持。
 func TestGenerationsWithImageRoutesToEdits(t *testing.T) {
 	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	env.handler.cfg.ImageGenerationsAcceptsImage = true
 	resp, body := postImage(t, env.gateway.URL, map[string]any{
 		"prompt": "把背景换成雪山", "image": "data:image/png;base64," + pngB64("a"),
 	})
@@ -2358,10 +2374,10 @@ func TestGenerationsWithImageRoutesToEdits(t *testing.T) {
 	}
 }
 
-// TestGenerationsMultiImage 守多图：image 数组要全部转过去。
-func TestGenerationsMultiImage(t *testing.T) {
+// TestEditsMultiImage 守多图：image 数组要全部转过去。
+func TestEditsMultiImage(t *testing.T) {
 	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
-	resp, body := postImage(t, env.gateway.URL, map[string]any{
+	resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
 		"prompt": "合成一张海报",
 		"image":  []any{"data:image/png;base64," + pngB64("a"), pngB64("b")},
 	})
@@ -2392,17 +2408,326 @@ func TestGenerationsNullImageIsTextToImage(t *testing.T) {
 	}
 }
 
-// TestGenerationsRejectsURLImageRef 守 SSRF 边界：不让网关替调用方抓外链。
-func TestGenerationsRejectsURLImageRef(t *testing.T) {
+// postImageEditsJSON 用 JSON 形态打 /v1/images/edits。
+//
+// OpenAI 的 edits 规范写的是 multipart，但 JSON 是网关认的另一种编码；
+// 图生图相关的用例统一走这里，避免依赖 multipart 组装的细节。
+func postImageEditsJSON(t *testing.T, base string, body any) (*http.Response, []byte) {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	req, _ := http.NewRequest(http.MethodPost, base+"/v1/images/edits", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/images/edits: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	return resp, out
+}
+
+// TestGenerationsRejectsImagePointsToEdits 守双端点分工。
+//
+// OpenAI 的 generations 参数表里没有 image。静默忽略会让调用方以为图生图
+// 生效、实际拿到一张无关新图（上游 /images/gen 正是这种行为），所以必须
+// 明确失败并指向正确的端点。
+func TestGenerationsRejectsImagePointsToEdits(t *testing.T) {
 	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
 	resp, body := postImage(t, env.gateway.URL, map[string]any{
+		"prompt": "改成水彩", "image": "iVBORw0KGgo=",
+	})
+	if resp.StatusCode != 400 {
+		t.Fatalf("generations 带 image 应当 400，实际 %d: %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "/v1/images/edits") {
+		t.Fatalf("提示里应指向 edits 端点: %s", body)
+	}
+	if env.imageHits.Load() != 0 || env.editHits.Load() != 0 {
+		t.Fatal("被拒的请求不该打上游")
+	}
+}
+
+// TestGenerationsAcceptsImageWhenEnabled 守兼容开关：老用法打开后仍然可用。
+func TestGenerationsAcceptsImageWhenEnabled(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	env.handler.cfg.ImageGenerationsAcceptsImage = true
+	resp, body := postImage(t, env.gateway.URL, map[string]any{
+		"prompt": "改成水彩", "image": "iVBORw0KGgo=",
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("打开兼容开关后应当可用，实际 %d: %s", resp.StatusCode, body)
+	}
+	if env.editHits.Load() != 1 {
+		t.Fatalf("有图必须走 /images/edits，实际命中 %d 次", env.editHits.Load())
+	}
+}
+
+// TestEditsRejectsMaskWithMultipleImages 守 image-adapter §1.6.4：
+// mask 只对单张底图有定义，多图 + mask 在语义上无处落地（区域 targeting
+// 落在哪张图上没有答案）。上游收到这种组合的行为未测，不该赌。
+func TestEditsRejectsMaskWithMultipleImages(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
+		"prompt": "只改左上角",
+		"image":  []any{pngB64("a"), pngB64("b")},
+		"mask":   pngB64("mask"),
+	})
+	if resp.StatusCode != 400 {
+		t.Fatalf("多图 + mask 应当 400，实际 %d: %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "单张底图") {
+		t.Fatalf("提示应说明只支持单张底图: %s", body)
+	}
+	if env.editHits.Load() != 0 {
+		t.Fatal("参数被拒时不该打上游")
+	}
+}
+
+// TestEditsRejectsMaskWithMultipleFiles 守同一条规则的 multipart 形态：
+// 文件字段同样会凑出多张底图，不能只在 JSON 路径上拦。
+func TestEditsRejectsMaskWithMultipleFiles(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("prompt", "只改左上角")
+	for _, tag := range []string{"a", "b"} {
+		fw, err := mw.CreateFormFile("image", tag+".png")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = fw.Write(testPNG(tag))
+	}
+	fw, err := mw.CreateFormFile("mask", "mask.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = fw.Write(testPNG("mask"))
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodPost, env.gateway.URL+"/v1/images/edits", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 400 {
+		t.Fatalf("多文件 + mask 应当 400，实际 %d: %s", resp.StatusCode, body)
+	}
+	if env.editHits.Load() != 0 {
+		t.Fatal("参数被拒时不该打上游")
+	}
+}
+
+// TestEditsAcceptsMaskWithSingleImage 反守上一条：别把守卫写成「有 mask 就拒」。
+func TestEditsAcceptsMaskWithSingleImage(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
+		"prompt": "只改左上角",
+		"image":  pngB64("a"),
+		"mask":   pngB64("mask"),
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("单图 + mask 应当可用，实际 %d: %s", resp.StatusCode, body)
+	}
+	if env.editHits.Load() != 1 {
+		t.Fatal("应当打一次上游 edits")
+	}
+}
+
+// pngOfSize 造一张指定尺寸的合法 PNG（base64），用于尺寸校验用例。
+func pngOfSize(w, h int) string {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		panic(err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+// TestEditsMaskSizeMustMatchImage 守「mask 与底图同尺寸」。
+//
+// image-adapter §1.6.1 要求尺寸不同就重采样；这里选择拒单（上游对不匹配的
+// 反应没测过，静默转发可能变成整图重画）。读不出尺寸时放行，不误拒。
+func TestEditsMaskSizeMustMatchImage(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
+		"prompt": "只改左上角",
+		"image":  pngOfSize(8, 8),
+		"mask":   pngOfSize(8, 8),
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("同尺寸应当通过，实际 %d: %s", resp.StatusCode, body)
+	}
+
+	env2 := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	resp2, body2 := postImageEditsJSON(t, env2.gateway.URL, map[string]any{
+		"prompt": "只改左上角",
+		"image":  pngOfSize(8, 8),
+		"mask":   pngOfSize(16, 16),
+	})
+	if resp2.StatusCode != 400 {
+		t.Fatalf("尺寸不一致应当 400，实际 %d: %s", resp2.StatusCode, body2)
+	}
+	if !strings.Contains(string(body2), "不一致") {
+		t.Fatalf("提示应说明尺寸不一致: %s", body2)
+	}
+	if env2.editHits.Load() != 0 {
+		t.Fatal("参数被拒时不该打上游")
+	}
+}
+
+// TestEditsErrorBodyDoesNotLeakUpstreamText 把「错误不回显上游」的守卫
+// 补到图片路径：对话路径有 TestErrorBodyDoesNotLeakUpstreamText，
+// 但那是另一个出口（chat 的 SSE 首帧），图生图走的是 serveImage → errorResponse。
+func TestEditsErrorBodyDoesNotLeakUpstreamText(t *testing.T) {
+	const secret = "INTERNAL-SECRET-9f3a"
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	env.imageMu.Lock()
+	env.editFailMessage = secret + " at http://10.0.0.7/admin?token=abc"
+	env.imageMu.Unlock()
+
+	resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
+		"prompt": "改成水彩", "image": pngB64("a"),
+	})
+	if resp.StatusCode != 502 {
+		t.Fatalf("上游 500 应当收敛成 502，实际 %d: %s", resp.StatusCode, body)
+	}
+	for _, banned := range []string{secret, "10.0.0.7", "token=abc"} {
+		if strings.Contains(string(body), banned) {
+			t.Fatalf("公开错误回显了上游内容 %q：%s", banned, body)
+		}
+	}
+	if !strings.Contains(string(body), "上游返回错误") {
+		t.Fatalf("应当是网关自己的固定文案，实际：%s", body)
+	}
+	// 原文必须留在服务端（面板的账号 last_error 靠它排障）。
+	found := false
+	for _, it := range env.pool.List() {
+		if strings.Contains(it.LastError, secret) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("上游原文应当留在账号 last_error 里")
+	}
+}
+
+// TestEditsURLFailureHidesSignedQuery 守「下载失败的错误体不带链接的查询串」：
+// 图源可能是带签名的对象存储地址，签名参数不该进客户端日志。
+func TestEditsURLFailureHidesSignedQuery(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
+		"prompt": "改成水彩",
+		"image":  "http://127.0.0.1:18765/a.png?q-ak=AKIDSECRET123&q-signature=deadbeef",
+	})
+	if resp.StatusCode != 400 {
+		t.Fatalf("环回地址应当 400，实际 %d: %s", resp.StatusCode, body)
+	}
+	for _, banned := range []string{"127.0.0.1", "q-ak", "AKIDSECRET123", "q-signature", "deadbeef", "18765"} {
+		if strings.Contains(string(body), banned) {
+			t.Fatalf("错误体不该带 URL 的查询串/端口 %q：%s", banned, body)
+		}
+	}
+	if !strings.Contains(string(body), "不允许访问") {
+		t.Fatalf("应当说明目标不允许访问: %s", body)
+	}
+}
+
+// TestEditsAcceptsURLImageRef 守 URL 载体：收下链接、下载、转成上游的 multipart。
+//
+// 注入 transport 是因为图源是 httptest（127.0.0.1），会被 IP 守卫拦掉；
+// 守卫本身由 TestImageRefAddrBlocked / TestImageRefFetcherRejectsLoopback 守。
+func TestEditsAcceptsURLImageRef(t *testing.T) {
+	png := testPNG("remote")
+	imgSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(png)
+	}))
+	defer imgSrv.Close()
+
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	env.handler.cfg.imageFetchTransport = &http.Transport{}
+
+	resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
+		"prompt": "改成水彩", "image": imgSrv.URL + "/a.png",
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("URL 载体应当被接受，实际 %d: %s", resp.StatusCode, body)
+	}
+	if got := env.editHits.Load(); got != 1 {
+		t.Fatalf("带图必须走 /images/edits，实际命中 %d 次", got)
+	}
+	if !strings.Contains(env.editCType, "multipart/form-data") {
+		t.Fatalf("上游收到的应当是 multipart，实际 %q", env.editCType)
+	}
+	if !env.editHasFile {
+		t.Fatal("下载到的图必须作为文件字段发给上游")
+	}
+}
+
+// TestEditsRejectsPrivateURLImageRef 守 SSRF 边界：载体收下了，目标仍要过守卫。
+func TestEditsRejectsPrivateURLImageRef(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	for _, ref := range []string{
+		"http://127.0.0.1:1/a.png",
+		"http://169.254.169.254/latest/meta-data/",
+		"http://10.0.0.1/a.png",
+		"http://[::1]/a.png",
+	} {
+		resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
+			"prompt": "改成水彩", "image": ref,
+		})
+		if resp.StatusCode != 400 {
+			t.Fatalf("%s 应当 400，实际 %d: %s", ref, resp.StatusCode, body)
+		}
+		if !strings.Contains(string(body), "不允许访问") {
+			t.Fatalf("%s 的提示应当说明目标不允许访问: %s", ref, body)
+		}
+	}
+	if env.editHits.Load() != 0 {
+		t.Fatal("参数被拒时不该打上游")
+	}
+}
+
+// TestEditsReadsOwnImageURLFromDisk 守「自家的图直读盘」：
+// 故意不注入 transport —— 一旦它去发网络请求，守卫会拦掉 127.0.0.1，测试就红。
+func TestEditsReadsOwnImageURLFromDisk(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	dir := t.TempDir()
+	png := testPNG("own")
+	name := imageID(png) + ".png"
+	if err := os.WriteFile(filepath.Join(dir, name), png, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env.handler.cfg.ImageDir = dir
+	env.handler.cfg.ImagePublicBase = env.gateway.URL
+
+	resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
+		"prompt": "再改一次", "image": env.gateway.URL + "/v1/images/" + name,
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("自家图片应当直读成功，实际 %d: %s", resp.StatusCode, body)
+	}
+	if env.editHits.Load() != 1 {
+		t.Fatal("应当走 /images/edits 一次")
+	}
+}
+
+// TestEditsRejectsURLWhenDisabled 守开关：images.url_input=false 时回到纯 base64。
+func TestEditsRejectsURLWhenDisabled(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	env.handler.cfg.DisableImageURLInput = true
+	resp, body := postImageEditsJSON(t, env.gateway.URL, map[string]any{
 		"prompt": "改成水彩", "image": "https://example.com/a.png",
 	})
 	if resp.StatusCode != 400 {
-		t.Fatalf("URL 形态应当 400，实际 %d", resp.StatusCode)
+		t.Fatalf("关闭后 URL 应当 400，实际 %d", resp.StatusCode)
 	}
-	if !strings.Contains(string(body), "base64") {
-		t.Fatalf("提示里应说明改用 base64: %s", body)
+	if !strings.Contains(string(body), "url_input") {
+		t.Fatalf("提示里应说明是 images.url_input 关着: %s", body)
 	}
 	if env.editHits.Load() != 0 {
 		t.Fatal("参数被拒时不该打上游")

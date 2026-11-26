@@ -5,13 +5,21 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"image"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+
+	// 只为 image.DecodeConfig 注册格式（读 mask / 底图尺寸，不解码像素）。
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 
 	"github.com/rsfree/xhx2api/internal/auth"
 	"github.com/rsfree/xhx2api/internal/pool"
@@ -51,6 +59,24 @@ const (
 	// maxImageJSONBytes 是图片 JSON 请求体上限，与 multipart 的 64MiB 对齐
 	// （nginx 的 client_max_body_size 也是 64m）。
 	maxImageJSONBytes = 64 << 20
+
+	// maxImageTotalBytes 是一次请求里所有输入图的总字节上限。
+	//
+	// 单张 20MB × 16 张 = 320MB，全部会进内存再拼成 multipart 发给上游：
+	// 既撑不住，也超过上游与 nginx 的 64MiB。取 48MiB 给 multipart 边界留余量。
+	//
+	// URL 载体让这条限制从「客户端要上传多少」变成了「服务端要拉多少」——
+	// 16 个链接的请求体只有 1KB，但代价全落在网关这边，所以必须单独卡总量。
+	maxImageTotalBytes = 48 << 20
+
+	// imageRefFetchConcurrency 是一批 URL 垫图的并发上限。
+	//
+	// 不按张数全开：16 张同时打同一个 CDN 基本等于自我限流。
+	// 6 并发跑 16 张只要 3 批，与总预算（默认 30s）吻合。
+	imageRefFetchConcurrency = 6
+
+	// defaultImageURLFetchTimeout 是一批 URL 垫图的总预算（不是单张）。
+	defaultImageURLFetchTimeout = 30 * time.Second
 )
 
 // 允许透传给上游的参数（其余一律丢弃：上游对未声明字段严格校验）。
@@ -66,21 +92,23 @@ const imageRateRetryDelay = 2 * time.Second
 
 // imageGenerations 处理 POST /v1/images/generations。
 //
-// 这个端点同时承担文生图与图生图：
-//   - 没有 `image` 字段 → 走上游 /images/gen（纯文生图）；
-//   - 带 `image`（字符串或数组）→ 网关自己转成 multipart 打 /images/edits。
+// 按 OpenAI 的契约，这个端点**只做文生图**：官方 generations 的参数表里没有
+// `image`，图生图是 /v1/images/edits 的职责。所以默认收到 `image` 会 400 并
+// 指向 edits——不静默忽略，也不偷偷转成图生图（后者会让客户端以为自己在用
+// OpenAI，实际拿到的是另一个端点的语义）。
 //
-// `image` 支持 data URI 与裸 base64；`null` / `[]` / 空串一律视为「没有图」，
-// 和 OpenAI SDK 的两种空值写法对齐。
+// 历史用法「把图塞给 generations」由 images.generations_accepts_image 保留：
+// 打开后网关按「有图就转 edits」处理，与旧版本一致。
 func (h *Handler) imageGenerations(w http.ResponseWriter, r *http.Request) {
-	h.handleImageJSON(w, r, time.Now(), traceFrom(r.Context()))
+	h.handleImageJSON(w, r, time.Now(), traceFrom(r.Context()), false)
 }
 
 // handleImageJSON 解析 OpenAI Images 的 JSON 形态。
 //
-// generations 与 edits 共用它：两个端点的差别只在传输方式（JSON vs multipart），
-// 语义完全一致，所以 /v1/images/edits 收到 JSON 也走这里（见 imageEdits）。
-func (h *Handler) handleImageJSON(w http.ResponseWriter, r *http.Request, started time.Time, tr *requestTrace) {
+// generations 与 edits 共用它：两个端点的差别在传输方式（JSON vs multipart）
+// 之外，还有一处语义差别——**generations 不带输入图**（editsOnly=false）。
+// 其余解析、载体换算、预算校验完全一致，复制一份迟早会分叉。
+func (h *Handler) handleImageJSON(w http.ResponseWriter, r *http.Request, started time.Time, tr *requestTrace, editsOnly bool) {
 	// 用图专用的上限：base64 有 4/3 膨胀，一张 4K PNG 就要 7MB，
 	// 沿用对话的 32MiB 会让「两张 4K 图生图」直接 413。
 	limit := h.cfg.MaxBodyBytes
@@ -104,38 +132,88 @@ func (h *Handler) handleImageJSON(w http.ResponseWriter, r *http.Request, starte
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	// 张数在下载之前判：超限是零成本的结论，不该先替调用方拉 20 张图再报错。
+	if len(refs) > maxImagesPerReq {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			fmt.Sprintf("一次最多 %d 张输入图", maxImagesPerReq))
+		return
+	}
 	// mask 只在有图时有意义（无图还给 mask 是调用方搞错了）。
-	if maskRef, _ := payload["mask"].(string); strings.TrimSpace(maskRef) != "" {
-		if len(refs) == 0 {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-				"mask 需要配合 image 使用：纯文生图没有可遮罩的区域")
-			return
-		}
-		if req.mask, err = decodeImageRef(maskRef); err != nil {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "mask 解码失败: "+err.Error())
-			return
-		}
+	maskRef, _ := payload["mask"].(string)
+	maskRef = strings.TrimSpace(maskRef)
+	if maskRef != "" && len(refs) == 0 {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			"mask 需要配合 image 使用：纯文生图没有可遮罩的区域")
+		return
+	}
+	// mask 只对单张底图有定义。
+	//
+	// 区域 targeting 落在哪张图上没有答案，OpenAI 也只在单图上定义 mask；
+	// 上游收到「多图 + mask」的行为未测。与其让它挑一张、把另外几张整图重画，
+	// 不如在零成本的地方拒掉（image-adapter §1.6.4）。
+	if maskRef != "" && len(refs) > 1 {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			fmt.Sprintf("mask 只支持单张底图，当前给了 %d 张", len(refs)))
+		return
+	}
+	// 双端点分工：generations 只做文生图。
+	//
+	// 拒绝放在下载之前——判定一个请求不合规不该先花 30 秒替它拉图。
+	// 不选「静默忽略 image」：OpenAI 会忽略未知字段，但那会让调用方以为
+	// 图生图生效了，而实际拿到一张无关的新图（上游 /images/gen 正是这么做的，
+	// 见 upstream/images.go 的实测记录）。宁可明确失败。
+	if !editsOnly && !h.cfg.ImageGenerationsAcceptsImage && (len(refs) > 0 || maskRef != "") {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			"图生图请用 POST /v1/images/edits（OpenAI 的 generations 只做文生图）；"+
+				"要继续在 generations 上传图，把 images.generations_accepts_image 设为 true")
+		return
 	}
 	if req.prompt == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "prompt 必填（上游对空 prompt 直接 400）")
 		return
 	}
-	for _, ref := range refs {
-		blob, derr := decodeImageRef(ref)
-		if derr != nil {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "image 解码失败: "+derr.Error())
-			return
-		}
-		if len(blob) > maxImageBytes {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-				fmt.Sprintf("单张图超过 %d MB", maxImageBytes>>20))
-			return
-		}
-		req.images = append(req.images, blob)
+
+	// URL 载体要下载：整批共享一个预算（单张的连接/响应头超时更短，见 images_fetch.go）。
+	ctx, cancel := h.imageFetchContext(r)
+	defer cancel()
+
+	// mask 与 images 并行：两者都是 URL 时，没有理由让主图等遮罩先下完。
+	// 提前 return 时 defer cancel 会把还在跑的 mask 下载一并取消，不会泄漏。
+	var (
+		maskBlob []byte
+		maskErr  error
+		maskDone chan struct{}
+	)
+	if maskRef != "" {
+		maskDone = make(chan struct{})
+		go func(ref string) {
+			defer close(maskDone)
+			maskBlob, maskErr = h.imageRefBytes(ctx, r, ref)
+		}(maskRef)
 	}
-	if len(req.images) > maxImagesPerReq {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-			fmt.Sprintf("一次最多 %d 张输入图", maxImagesPerReq))
+	if req.images, err = h.resolveImageRefs(ctx, r, refs); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "image 解码失败: "+err.Error())
+		return
+	}
+	if maskDone != nil {
+		<-maskDone
+		if maskErr != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "mask 解码失败: "+maskErr.Error())
+			return
+		}
+		if len(maskBlob) > maxImageBytes {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+				fmt.Sprintf("mask 超过 %d MB", maxImageBytes>>20))
+			return
+		}
+		req.mask = maskBlob
+	}
+	if err := checkImageBudget(req.images); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if err := checkMaskGeometry(req.images, req.mask); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 
@@ -157,7 +235,7 @@ func (h *Handler) handleImageJSON(w http.ResponseWriter, r *http.Request, starte
 	h.dispatchImage(w, r, started, tr, req)
 }
 
-// imageEdits 处理 POST /v1/images/edits。
+// imageEdits 处理 POST /v1/images/edits —— 图生图的**唯一**入口。
 //
 // 三种请求形态都收，语义完全一致（都是「带输入图的图生图」）：
 //
@@ -168,13 +246,16 @@ func (h *Handler) handleImageJSON(w http.ResponseWriter, r *http.Request, starte
 // 为什么不只认 multipart：OpenAI 的 edits 规范只写了 multipart，但实际客户端
 // 五花八门——有人发 JSON（因为 generations 就是 JSON），有人用 curl -d（默认
 // urlencoded）。因为「编码不同」回一个看不懂的 400，纯属刁难调用方。
+//
+// 反过来，generations 不再接图（见 imageGenerations）：两个端点各有主责，
+// 宽容只用在「同一个语义的不同编码」上，不用在「换个端点也能干」上。
 func (h *Handler) imageEdits(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	tr := traceFrom(r.Context())
 
 	ct := strings.ToLower(r.Header.Get("Content-Type"))
 	if strings.HasPrefix(ct, "application/json") {
-		h.handleImageJSON(w, r, started, tr)
+		h.handleImageJSON(w, r, started, tr, true)
 		return
 	}
 
@@ -206,7 +287,14 @@ func (h *Handler) imageEdits(w http.ResponseWriter, r *http.Request) {
 		files = r.MultipartForm.File
 	}
 
-	req, err := buildFormImageRequest(values, files, urlencoded)
+	parts, err := collectFormImageParts(values, files, urlencoded)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	ctx, cancel := h.imageFetchContext(r)
+	defer cancel()
+	req, err := h.finishFormImageRequest(ctx, r, parts)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
@@ -227,21 +315,38 @@ func formFirst(values map[string][]string, key string) string {
 	return ""
 }
 
-// buildFormImageRequest 把表单拆成规范请求。multipart 与 urlencoded 共用。
+// formImageParts 是表单解析出的半成品：文件已读成字节，文本引用还没解析。
+//
+// 拆成两步是因为文本引用可能是 URL（要下载、并行、有预算），而文件读取与
+// 表单结构校验是零网络的——后者应当先把所有能判死的错误判掉，不要让调用方
+// 等了 20 秒下载才发现「prompt 是空的」。
+type formImageParts struct {
+	prompt   string
+	files    [][]byte
+	refs     []string
+	maskFile []byte
+	maskRef  string
+	title    string
+	model    string
+	fields   map[string]string
+}
+
+// collectFormImageParts 把表单拆成结构 + 待解析引用。multipart 与 urlencoded 共用。
 //
 // urlencoded=true 时要把 base64 里的 `+` 还原回来：表单解码会把 `+` 当空格，
 // 而 base64 字母表里本来就有 `+`——不还原的话，含 `+` 的图会静默解错/解不出。
-func buildFormImageRequest(values map[string][]string, files map[string][]*multipart.FileHeader, urlencoded bool) (imageRequest, error) {
-	req := imageRequest{prompt: strings.TrimSpace(formFirst(values, "prompt")), fields: map[string]string{}}
-	if req.prompt == "" {
-		return req, fmt.Errorf("prompt 必填")
+// 这条对 URL 一并生效：两者都是「客户端没按 %2B/%20 编码」的同一种容错。
+func collectFormImageParts(values map[string][]string, files map[string][]*multipart.FileHeader, urlencoded bool) (formImageParts, error) {
+	parts := formImageParts{prompt: strings.TrimSpace(formFirst(values, "prompt")), fields: map[string]string{}}
+	if parts.prompt == "" {
+		return parts, fmt.Errorf("prompt 必填")
 	}
 
-	// 图片有两种进法，都要收：
+	// 图片有三种进法，都要收：
 	//   1) 文件字段（image / image[]）—— 浏览器表单、curl -F、SDK 都是这种；
 	//   2) 文本字段（同名，值是 base64 或 data URI）—— 把 JSON 硬转表单的
-	//      客户端常这样发；只认文件会让它拿到「image 必填」的 400。
-	var refs []string
+	//      客户端常这样发；只认文件会让它拿到「image 必填」的 400；
+	//   3) 文本字段里放 http(s) URL —— 要下载，所以只登记、留给第二步并行处理。
 	for _, key := range []string{"image", "image[]"} {
 		for _, fh := range files[key] {
 			// 空 part 表示「没附文件」（浏览器未选文件、或读取失败），
@@ -250,74 +355,109 @@ func buildFormImageRequest(values map[string][]string, files map[string][]*multi
 				continue
 			}
 			if fh.Size > maxImageBytes {
-				return req, fmt.Errorf("%s 超过 %d MB", fh.Filename, maxImageBytes>>20)
+				return parts, fmt.Errorf("%s 超过 %d MB", fh.Filename, maxImageBytes>>20)
 			}
 			f, oerr := fh.Open()
 			if oerr != nil {
-				return req, fmt.Errorf("读取上传图片失败: %w", oerr)
+				return parts, fmt.Errorf("读取上传图片失败: %w", oerr)
 			}
 			blob, rerr := io.ReadAll(io.LimitReader(f, maxImageBytes))
 			_ = f.Close()
 			if rerr != nil {
-				return req, fmt.Errorf("读取上传图片失败: %w", rerr)
+				return parts, fmt.Errorf("读取上传图片失败: %w", rerr)
 			}
-			req.images = append(req.images, blob)
+			parts.files = append(parts.files, blob)
 		}
 		for _, v := range values[key] {
-			if strings.TrimSpace(v) != "" {
-				refs = append(refs, v)
+			if strings.TrimSpace(v) == "" {
+				continue
 			}
+			if urlencoded {
+				v = strings.ReplaceAll(v, " ", "+")
+			}
+			parts.refs = append(parts.refs, v)
 		}
 	}
-	for _, ref := range refs {
-		if urlencoded {
-			ref = strings.ReplaceAll(ref, " ", "+")
-		}
-		blob, derr := decodeImageRef(ref)
-		if derr != nil {
-			return req, fmt.Errorf("image 解码失败: %w", derr)
-		}
-		if len(blob) > maxImageBytes {
-			return req, fmt.Errorf("单张图超过 %d MB", maxImageBytes>>20)
-		}
-		req.images = append(req.images, blob)
+	if len(parts.files)+len(parts.refs) == 0 {
+		return parts, fmt.Errorf("image 必填（字段名 image 或 image[]，可传文件、base64/data URI 或 http(s) URL）")
 	}
-	if len(req.images) == 0 {
-		return req, fmt.Errorf("image 必填（字段名 image 或 image[]，可传文件或 base64/data URI）")
-	}
-	if len(req.images) > maxImagesPerReq {
-		return req, fmt.Errorf("一次最多 %d 张输入图", maxImagesPerReq)
+	if len(parts.files)+len(parts.refs) > maxImagesPerReq {
+		return parts, fmt.Errorf("一次最多 %d 张输入图", maxImagesPerReq)
 	}
 
-	// mask：文件优先，其次是文本形态。
+	// mask：文件优先，其次是文本形态（文本可能是 URL，同理留到第二步）。
 	if fhs := files["mask"]; len(fhs) > 0 && fhs[0].Size > 0 {
 		f, oerr := fhs[0].Open()
 		if oerr != nil {
-			return req, fmt.Errorf("读取 mask 失败: %w", oerr)
+			return parts, fmt.Errorf("读取 mask 失败: %w", oerr)
 		}
 		defer f.Close()
 		blob, rerr := io.ReadAll(io.LimitReader(f, maxImageBytes))
 		if rerr != nil {
-			return req, fmt.Errorf("读取 mask 失败: %w", rerr)
+			return parts, fmt.Errorf("读取 mask 失败: %w", rerr)
 		}
-		req.mask = blob
+		parts.maskFile = blob
 	} else if v := strings.TrimSpace(formFirst(values, "mask")); v != "" {
 		if urlencoded {
 			v = strings.ReplaceAll(v, " ", "+")
 		}
-		blob, derr := decodeImageRef(v)
-		if derr != nil {
-			return req, fmt.Errorf("mask 解码失败: %w", derr)
-		}
-		req.mask = blob
+		parts.maskRef = v
+	}
+	// mask 只对单张底图有定义，理由见 handleImageJSON。放在下载之前：
+	// 这个结论不依赖任何一张图的字节。
+	if (parts.maskFile != nil || parts.maskRef != "") && len(parts.files)+len(parts.refs) > 1 {
+		return parts, fmt.Errorf("mask 只支持单张底图，当前给了 %d 张", len(parts.files)+len(parts.refs))
 	}
 
-	req.title = strings.TrimSpace(formFirst(values, "title"))
-	req.model = strings.TrimSpace(formFirst(values, "model"))
+	parts.title = strings.TrimSpace(formFirst(values, "title"))
+	parts.model = strings.TrimSpace(formFirst(values, "model"))
 	for _, key := range imageFieldWhitelist {
 		if v := strings.TrimSpace(formFirst(values, key)); v != "" {
-			req.fields[key] = v
+			parts.fields[key] = v
 		}
+	}
+	return parts, nil
+}
+
+// finishFormImageRequest 解析文本引用并拼成规范请求。URL 引用在这里并行下载。
+//
+// 顺序保持「文件在前、文本引用在后」：历史上就是这么拼的，客户端不该因为
+// 某个引用从 base64 换成 URL 而发现图片顺序变了。
+func (h *Handler) finishFormImageRequest(ctx context.Context, r *http.Request, parts formImageParts) (imageRequest, error) {
+	req := imageRequest{
+		prompt: parts.prompt, title: parts.title, model: parts.model,
+		fields: parts.fields, images: parts.files, mask: parts.maskFile,
+	}
+	// mask 与引用并行，理由同 handleImageJSON：没有依赖关系的下载不该排队。
+	var (
+		maskBlob []byte
+		maskErr  error
+		maskDone chan struct{}
+	)
+	if req.mask == nil && parts.maskRef != "" {
+		maskDone = make(chan struct{})
+		go func(ref string) {
+			defer close(maskDone)
+			maskBlob, maskErr = h.imageRefBytes(ctx, r, ref)
+		}(parts.maskRef)
+	}
+	blobs, err := h.resolveImageRefs(ctx, r, parts.refs)
+	if err != nil {
+		return req, fmt.Errorf("image 解码失败: %w", err)
+	}
+	req.images = append(req.images, blobs...)
+	if maskDone != nil {
+		<-maskDone
+		if maskErr != nil {
+			return req, fmt.Errorf("mask 解码失败: %w", maskErr)
+		}
+		req.mask = maskBlob
+	}
+	if err := checkImageBudget(req.images); err != nil {
+		return req, err
+	}
+	if err := checkMaskGeometry(req.images, req.mask); err != nil {
+		return req, err
 	}
 	return req, nil
 }
@@ -507,11 +647,188 @@ func extractImageRefs(v any) ([]string, error) {
 	return nil, fmt.Errorf("image 必须是字符串、字符串数组或 null（支持 base64 与 data URI）")
 }
 
-// decodeImageRef 把 data URI 或裸 base64 解成字节。
+// isHTTPRef 判断引用是不是 http(s) 地址。
 //
-// 不支持 http(s) URL：那需要网关替调用方去抓取，会引入 SSRF 面（内网地址、
-// 元数据服务）。要这种形态就让客户端自己下载后转 base64。
-func decodeImageRef(ref string) ([]byte, error) {
+// 只看前缀，不做 URL 解析：base64 字母表里没有 `:` 和 `/`，所以这个判断对
+// 「裸 base64 恰好含 http」没有误判风险，而它要在每张图上都跑一次。
+func isHTTPRef(ref string) bool {
+	lower := strings.ToLower(strings.TrimSpace(ref))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
+// imageFetchContext 给一批 URL 垫图套上总预算。
+//
+// 单张有自己的连接超时（5s）与响应头超时（10s），但整批需要一个上限：
+// 16 张并行、每张都可能卡满，没有总预算时请求会被拖到调用方先放弃。
+func (h *Handler) imageFetchContext(r *http.Request) (context.Context, context.CancelFunc) {
+	d := h.cfg.ImageURLFetchTimeout
+	if d <= 0 {
+		d = defaultImageURLFetchTimeout
+	}
+	return context.WithTimeout(r.Context(), d)
+}
+
+// imageRefBytes 解析单个引用：本地落盘直读，其余 URL 走受控下载。
+func (h *Handler) imageRefBytes(ctx context.Context, r *http.Request, ref string) ([]byte, error) {
+	ref = strings.TrimSpace(ref)
+	if !isHTTPRef(ref) {
+		return decodeImageData(ref)
+	}
+	if h.cfg.DisableImageURLInput {
+		return nil, errors.New("URL 形态已关闭（images.url_input=false），请改传 base64 或 data URI")
+	}
+	// 先看是不是自己的图：默认配置下「拿上一张的 url 继续改」是最高频的用法，
+	// 这种请求不该绕一圈网络回到自己的磁盘。
+	if blob, handled, err := h.localImageRef(r, ref); handled {
+		return blob, err
+	}
+	f := imageRefFetcher{
+		transport:  h.cfg.imageFetchTransport,
+		allowHosts: h.cfg.ImageURLFetchAllowHosts,
+		maxBytes:   maxImageBytes,
+	}
+	return f.fetch(ctx, ref)
+}
+
+// resolveImageRefs 把一批引用解析成字节：URL 并行下载，结果**按输入顺序**返回。
+//
+// 保序是契约（多图生图里「把第 1 张的风格套到第 2 张上」靠的就是顺序），
+// 并行是必要的：16 张串行 × 单张 10s 会把一次请求拖到 160s，而调用方
+// 只是给了 16 个链接。
+//
+// 任何一张失败就整体失败，不做「跳过坏的、返回剩下的」：静默少一张会让
+// 「合成这两张」变成「合成另一张」——请求 200、图也出来了，内容是错的。
+func (h *Handler) resolveImageRefs(ctx context.Context, r *http.Request, refs []string) ([][]byte, error) {
+	out := make([][]byte, len(refs))
+	type job struct {
+		idx int
+		ref string
+	}
+	jobs := make([]job, 0, len(refs))
+	for i, ref := range refs {
+		// 纯 base64 / data URI 是 CPU 工作，就地解掉，不占并发名额。
+		if !isHTTPRef(ref) {
+			blob, err := decodeImageData(ref)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = blob
+			continue
+		}
+		jobs = append(jobs, job{idx: i, ref: ref})
+	}
+	if len(jobs) == 0 {
+		return out, nil
+	}
+
+	// 第一个真错误决定返回文案；cancel 只是让还在排队的尽快退出，
+	// 它们随后产生的「已取消」不会盖掉 firstErr。
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sem := make(chan struct{}, imageRefFetchConcurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	for _, j := range jobs {
+		wg.Add(1)
+		go func(j job) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+
+			blob, err := h.imageRefBytes(ctx, r, j.ref)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					// 只报「第几张」，不抄 URL：错误体会进客户端日志/工单，
+					// 而链接的 path/query 可能带对象存储签名。多张时才加序号，
+					// 单张说「第 1 张」纯属噪音。
+					where := ""
+					if len(refs) > 1 {
+						where = fmt.Sprintf("第 %d 张: ", j.idx+1)
+					}
+					firstErr = fmt.Errorf("%s%w", where, err)
+					cancel()
+				}
+				mu.Unlock()
+				return
+			}
+			out[j.idx] = blob
+		}(j)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return out, nil
+}
+
+// checkImageBudget 校验单张与总量上限。返回的文案直接给调用方看。
+func checkImageBudget(images [][]byte) error {
+	var total int64
+	for _, blob := range images {
+		if len(blob) > maxImageBytes {
+			return fmt.Errorf("单张图超过 %d MB", maxImageBytes>>20)
+		}
+		total += int64(len(blob))
+	}
+	if total > maxImageTotalBytes {
+		return fmt.Errorf("输入图总量超过 %d MB（单张上限 %d MB，一次最多 %d 张）",
+			maxImageTotalBytes>>20, maxImageBytes>>20, maxImagesPerReq)
+	}
+	return nil
+}
+
+// imageBounds 只读文件头拿宽高，不解码像素。
+//
+// 依赖标准库已注册的格式（PNG / JPEG / GIF）；WebP 要 x/image，这里不引入——
+// 读不出就返回 ok=false，调用方跳过尺寸校验，宁可不查也不误拒。
+func imageBounds(blob []byte) (w, h int, ok bool) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(blob))
+	if err != nil {
+		return 0, 0, false
+	}
+	return cfg.Width, cfg.Height, true
+}
+
+// checkMaskGeometry 校验 mask 与底图同尺寸。
+//
+// image-adapter §1.6.1 要求「尺寸不同就重采样到底图」。这里选择**拒单**而不是
+// 重采样，理由有两条：
+//   - 重采样要引入解码 + 缩放（WebP 还得加依赖），而这条路径只有一个消费方（上游）；
+//   - 上游对「mask 尺寸与底图不一致」的反应**没测过**：它可能自己缩放，也可能
+//     忽略 mask 整图重画。后者是「调用方以为只改一块、实际整张被重画」，
+//     属于没有中间态的错——在测出结论之前，明确失败比赌它宽容好。
+//
+// 读不出尺寸（WebP / 损坏）时不拦：没有把握的判断不该变成 400。
+func checkMaskGeometry(images [][]byte, mask []byte) error {
+	if len(mask) == 0 || len(images) == 0 {
+		return nil
+	}
+	bw, bh, ok := imageBounds(images[0])
+	if !ok {
+		return nil
+	}
+	mw, mh, ok := imageBounds(mask)
+	if !ok {
+		return nil
+	}
+	if bw != mw || bh != mh {
+		return fmt.Errorf("mask 尺寸 %dx%d 与底图 %dx%d 不一致：请先重采样到同一尺寸"+
+			"（网关不做缩放，避免改变可编辑区域的边界）", mw, mh, bw, bh)
+	}
+	return nil
+}
+
+// decodeImageData 把 data URI 或裸 base64 解成字节。
+//
+// http(s) 引用不在这里处理：它需要发网络请求，走 imageRefBytes。这个函数是纯的，
+// 只做编码换算。
+func decodeImageData(ref string) ([]byte, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
 		return nil, fmt.Errorf("空图片")
@@ -526,8 +843,9 @@ func decodeImageRef(ref string) ([]byte, error) {
 		}
 		ref = ref[comma+1:]
 	}
-	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
-		return nil, fmt.Errorf("暂不支持 URL 形态：请由客户端下载后转成 base64 或 data URI")
+	if isHTTPRef(ref) {
+		// 调用方走错了分支：把 URL 当 base64 解只会得到一条看不懂的错。
+		return nil, fmt.Errorf("内部错误：URL 引用应走下载路径")
 	}
 	blob, err := base64.StdEncoding.DecodeString(ref)
 	if err != nil {
@@ -540,17 +858,31 @@ func decodeImageRef(ref string) ([]byte, error) {
 	return blob, nil
 }
 
-// sniffImageExt 按魔数给扩展名。
-func sniffImageExt(b []byte) string {
+// sniffImageFormat 按魔数判图片类型；ok=false 表示这些字节不像任何已知图片。
+//
+// 只认魔数，不认 Content-Type：CDN 回图片给 application/octet-stream 是常态，
+// 反过来给一段 HTML 标 image/png 也不稀奇。下载路径靠它挡掉「下回来的不是图」。
+func sniffImageFormat(b []byte) (string, bool) {
 	switch {
 	case bytes.HasPrefix(b, []byte("\x89PNG\r\n\x1a\n")):
-		return ".png"
+		return ".png", true
 	case bytes.HasPrefix(b, []byte("\xff\xd8\xff")):
-		return ".jpg"
+		return ".jpg", true
 	case bytes.HasPrefix(b, []byte("GIF87a")), bytes.HasPrefix(b, []byte("GIF89a")):
-		return ".gif"
+		return ".gif", true
 	case len(b) >= 12 && string(b[:4]) == "RIFF" && string(b[8:12]) == "WEBP":
-		return ".webp"
+		return ".webp", true
+	}
+	return "", false
+}
+
+// sniffImageExt 给上游的 multipart 文件名用扩展名。
+//
+// 判不出时兜底 .png：上游按扩展名选解码分支，给它一个不认的扩展名只会换来
+// 一条看不懂的错；至少 png 分支还能给出「这不是图」的结论。
+func sniffImageExt(b []byte) string {
+	if ext, ok := sniffImageFormat(b); ok {
+		return ext
 	}
 	return ".png"
 }

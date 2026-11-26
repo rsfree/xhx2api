@@ -125,7 +125,11 @@
       "gpt-image-2.5",
       "dall-e-2",
       "dall-e-3"
-    ]
+    ],
+    "generations_accepts_image": false,
+    "url_input": true,
+    "url_fetch_timeout_seconds": 30,
+    "url_fetch_allow_hosts": []
   },
   "models": {
     "hidden": [],

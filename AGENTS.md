@@ -149,6 +149,11 @@ tag 与 `latest`（默认分支）。
 | 限免模型 x0 | `sn-sensenova-6-8-flash` 等实测不扣积分（限免至 10-31） | 模型页标「免费」 |
 | **429 不是 IP 维度** | 同一账号从两个出口 IP（`210.121.44.245` / `117.88.13.53`）各发 6 个请求，**全部 200**；51 并发集中打时 429 率反而只有 0.6%（31–38 在途 0.6%、39–46 在途 6.3%）。限流绑**账号**，不绑 IP——别用换代理/换机解决 | 2026-10-30 实测，`/tmp/xhxprobe.py` |
 | **429 是秒级恢复的瞬时闸** | 被判「第 7 级退避、冷却 1.1h」的账号**直接打上游仍然 200**。原实现「429 → 账号级指数退避 60s→2h」把一次抖动放大成整池锁死：831 次 429 全是换号重试（attempts≥2），每次罚 2–3 个号，最终 7812 条 503（75%）。现改为**首次 429 原地等 2s 重试、不罚号不换号**，第 2 次才短冷却；基数 15s、封顶 5min | `server/handler.go` 的 `chatRateRetryDelay`、`pool.normalizeConfig`、`TestRotateOn429` / `TestRepeated429CoolsDown` / `TestSoftRateDefaultsAreMinutes` |
+| `image` 的 URL 载体 | 图像协议把 URL / data URI / 裸 base64 都列为合法字符串载体；上游 `/images/edits` 只吃 multipart 字节，所以 URL 只能由网关下载后内联。**不能用「拒收 URL」当防护**——那是把契约砍掉而不是解决问题 | `server/images_fetch.go`、`server.decodeImageData` |
+| SSRF 守卫必须是**解析→校验→直连 IP** | 「先 LookupIP 校验、再让 Transport 自己解析」是两次独立 DNS：TTL=0 时第一次答公网、第二次答 127.0.0.1（rebinding）。把解析收进 `DialContext`，实际 connect 的目标才是被校验过的 IP。另：`Transport.Proxy` 必须显式 nil——走代理时拨的是代理地址，目标藏在 CONNECT 里，校验被整体绕过 | `imageRefDialContext`、`newImageRefTransport` |
+| 自家图片的 URL 直读盘 | 默认配置下「拿上一张的 url 继续改」是最高频用法，走 HTTP 等于自己请求自己（过 nginx + 鉴权 + 几 MB 往返）。匹配 `public_base`/按请求推导的 base + `/v1/images/<name>` 就直接读盘；前缀命中但文件不在时报「已回收」，不回落网络 | `Handler.localImageRef`、测试 `TestEditsReadsOwnImageURLFromDisk` |
+| 输入图要卡**总量**，不只单张 | URL 把成本从「客户端上传多少」变成「服务端拉多少」：16 个链接的请求体 1KB，代价全在网关。16×20MB 会全进内存再拼 multipart，且超过上游/nginx 的 64MiB | `maxImageTotalBytes`（48MiB）、`checkImageBudget` |
+| generations **不收** `image` | OpenAI 的 generations 参数表里没有 image；上游 `/images/gen` 收到它会**静默忽略**（image_tokens=0、出无关新图）。网关「有图就偷偷转 edits」是只有自己知道的扩展——客户端以为走标准路径、语义已变。默认 400 指向 edits，老用法用 `images.generations_accepts_image` 恢复 | `Handler.imageGenerations`、`TestGenerationsRejectsImagePointsToEdits` |
 
 回归测试：`internal/upstream/upstream_test.go` 的 `TestClassify`（含 500+参数错误用例）、
 `internal/server/bodyfix_test.go`（含 512/768 边界）。

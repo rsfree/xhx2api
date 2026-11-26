@@ -265,6 +265,11 @@ func main() {
 		ImageUploader:         imageUploader,
 		QueueWait:             cfg.queueWait,
 		RefreshSkew:           time.Duration(cfg.Server.RefreshSkewSeconds) * time.Second,
+		// URL 垫图：开关翻成「禁用」（handler 零值 = 允许），预算与白名单原样传。
+		ImageGenerationsAcceptsImage: cfg.Images.GenerationsAcceptsImage,
+		DisableImageURLInput:         !cfg.ImageURLInputEnabled(),
+		ImageURLFetchTimeout:         cfg.ImageURLFetchTimeout(),
+		ImageURLFetchAllowHosts:      cfg.Images.URLFetchAllowHosts,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -14,12 +14,17 @@
 - **OpenAI SDK / curl** → `POST /v1/chat/completions`
 - **Claude Code / Anthropic SDK** → `POST /v1/messages`（含 `count_tokens`）
 - **Codex / 新版 Agent** → `POST /v1/responses`
-- **文生图 / 图生图 / 多图（OpenAI Images）** → `POST /v1/images/generations`。
-  不带 `image` 就是纯文生图；带 `image` 时网关自动转 multipart 打上游 `/images/edits`。
+- **文生图** → `POST /v1/images/generations`（JSON，只收 `prompt`，与 OpenAI 一致）。
+- **图生图 / 多图（OpenAI Images）** → `POST /v1/images/edits`。
   `image` 三种写法都收：**单张字符串**、**字符串数组**、**`null`**（= 没有图）；
-  每个元素可以是 **data URI** 或**裸 base64**（含 URL-safe / 缺 padding 的变体）。
-  `POST /v1/images/edits` 同时收 multipart 与 JSON：multipart 下 `image` / `image[]`
-  既可以是文件，也可以是 base64 文本字段（同名重复即数组）。
+  每个元素可以是 **http(s) URL**、**data URI** 或**裸 base64**（含 URL-safe / 缺 padding 的变体）。
+  指向本网关 `/v1/images/<id>` 的链接**直接读盘**，不外发请求；其它地址要过 SSRF 守卫
+  （环回 / 私网 / 链路本地 / 云元数据 / 组播 / 保留段一律拒），下载并行、结果保序。
+  multipart 下 `image` / `image[]` 既可以是文件，也可以是 base64 / URL 文本字段（同名重复即数组）；
+  edits 也收 JSON 与 urlencoded。一次最多 16 张，单张 20MB、合计 48MB。
+- 两个端点各有主责：**generations 收到 `image` 会 400 并指向 edits**（OpenAI 的
+  generations 参数表里没有 `image`；静默忽略会让人以为图生图生效了）。老用法
+  「把图塞给 generations」可设 `images.generations_accepts_image = true` 恢复。
 
 > 本项目与商汤科技**没有任何关系**，非官方、未获授权，仅用于**本人授权账号**在
 > 本机 / 私有环境下的协议互操作。请遵守上游服务条款：**不要**用于对外中转、批量
@@ -286,6 +291,10 @@ wire_api = "responses"
 | `images.max_total_mb` | `2048` | 落盘目录总量上限；`0` = 不限制。超限按 mtime 删最旧的到 90%（旧链接会 404）。改了要重启 |
 | `images.public_base` | 空 | 写进 url 的对外基址（如 `https://xhx2api.1task.cn`）。反代后面不填会生成内网地址 |
 | `images.dir` | 空 | 落盘目录（空 = `<state 同目录>/images`）；`return_url=false` 且没接 COS 时不落盘 |
+| `images.generations_accepts_image` | `false` | 让 `/v1/images/generations` 也收 `image`（有图自动转 edits）。默认关 = 严格按 OpenAI，带图会 400 并指向 `/v1/images/edits`。改了要重启 |
+| `images.url_input` | `true` | `image` / `mask` 是否接受 http(s) 链接。指向本网关 `/v1/images/<id>` 的直接读盘；其余地址必须过 SSRF 守卫（**这道守卫没有开关**）。改了要重启 |
+| `images.url_fetch_timeout_seconds` | `30` | 一批 URL 垫图下载的**总**预算（不是单张）；单张另有连接 5s、响应头 10s。改了要重启 |
+| `images.url_fetch_allow_hosts` | `[]` | 图源域名白名单，空 = 不限（只过 IP 守卫）。按标签边界匹配：`cdn.example.com` 不放行 `evilcdn.example.com`。改了要重启 |
 | `images.cos.*` | 关闭 | 传腾讯云 COS，url 用 COS 地址。字段：`secret_id` / `secret_key` / `bucket`（含 APPID）/ `region` / `prefix` / `base_url`（CDN 域名）/ `public_read`（带 `x-cos-acl: public-read`）/ `signed_ttl_seconds`（>0 时给临时签名链接）。开了自动启用 `return_url`；**上传失败回落本地盘**，不影响出图 |
 | `models.hidden` | `[]` | 黑名单：不列出 + 点名拒绝 |
 | `models.include_upstream_hidden` | `true` | `/v1/models` 也列出上游 `visible=false` 的模型。关掉则只列它官网展示的（需重启） |
@@ -459,7 +468,20 @@ curl -s http://127.0.0.1:7867/v1/images/generations \
 # 要 base64 就显式说（此时不落盘）
 curl -s ... -d '{"prompt":"...","response_format":"b64_json"}' \
   | jq -r '.data[0].b64_json' | base64 -d > cat.png
+
+# 图生图：multipart 是 OpenAI SDK / curl -F 的原生写法
+curl -s http://127.0.0.1:7867/v1/images/edits \
+  -H "Authorization: Bearer $API_KEY" \
+  -F 'prompt=把方块改成金色' -F 'image=@in.png'
+
+# 同一个端点也收 JSON：图可以是 URL / data URI / 裸 base64
+curl -s http://127.0.0.1:7867/v1/images/edits \
+  -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"prompt":"把方块改成金色","image":["https://cdn.example.com/a.png"]}'
 ```
+
+> `POST /v1/images/generations` 只做文生图：带 `image` 会 400 并指向 edits。
+> 想让老用法继续可用，设 `images.generations_accepts_image: true`。
 
 实测数据：
 
