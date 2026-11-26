@@ -1,6 +1,6 @@
 # xhx2api · ai-prod 部署声明（2026-10-26）
 #
-# 源（第一真源）：github.com/jushenzhidao/xhx2api —— Go 单二进制 + 内嵌面板。
+# 源（唯一真源）：github.com/rsfree/xhx2api —— Go 单二进制 + 内嵌面板。
 # 作用：把小浣熊（office-raccoon）网页端/桌面端登录态包成协议兼容网关
 #   （/v1/chat/completions、/v1/messages、/v1/responses、/v1/images/generations）
 #   + 运维面板 /panel/ + 定时任务（签到 9 点 / 保活 3 点）。
@@ -18,14 +18,14 @@
 #   mv 探测 → Resource busy。改成目录挂载后 config.json 是挂载点里的普通文件，rename 合法。
 #   （./auths 与 ./data 一直是目录挂载，所以账号/池状态写回从来没出过这个问题。）
 #
-# 镜像：ghcr.io/jushenzhidao/xhx2api（CI 的 docker workflow 在 push main 时构建多架构镜像，
+# 镜像：ghcr.io/rsfree/xhx2api（CI 的 docker workflow 在 push main 时构建多架构镜像，
 #   tag 为 main / latest / sha-<7位>）。默认钉 latest；回滚时改 XHX2API_IMAGE_TAG
 #   指向具体的 sha-<7位>，比 latest 可审计。
 name: xhx2api
 
 services:
   xhx2api:
-    image: ghcr.io/jushenzhidao/xhx2api:${XHX2API_IMAGE_TAG:-latest}
+    image: ghcr.io/rsfree/xhx2api:${XHX2API_IMAGE_TAG:-latest}
     container_name: xhx2api
     restart: unless-stopped
     user: "${PUID:-10001}:${PGID:-10001}"

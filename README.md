@@ -85,7 +85,7 @@ origin https://xiaohuanxiong.com
 ### 二进制
 
 ```bash
-git clone https://github.com/jushenzhidao/xhx2api && cd xhx2api
+git clone https://github.com/rsfree/xhx2api && cd xhx2api
 go build -o xhx2api ./cmd/server
 ./xhx2api -config ./config.json
 ```

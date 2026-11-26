@@ -1,7 +1,7 @@
 # xhx2api · ai-prod 运维说明
 
 公网入口：**https://xhx2api.1task.cn** 　面板：https://xhx2api.1task.cn/panel/
-本机回环：`127.0.0.1:39026` → 容器 `7867` 　源：github.com/jushenzhidao/xhx2api
+本机回环：`127.0.0.1:39026` → 容器 `7867` 　源：github.com/rsfree/xhx2api
 
 ## 目录
 
@@ -42,9 +42,9 @@ docker compose pull && docker compose up -d   # 拉新镜像并换
 ```bash
 cd /opt/xhx2api
 # 1) 看有哪些版本
-T=$(curl -s "https://ghcr.io/token?scope=repository:jushenzhidao/xhx2api:pull&service=ghcr.io" \
+T=$(curl -s "https://ghcr.io/token?scope=repository:rsfree/xhx2api:pull&service=ghcr.io" \
     | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
-curl -s -H "Authorization: Bearer $T" https://ghcr.io/v2/jushenzhidao/xhx2api/tags/list
+curl -s -H "Authorization: Bearer $T" https://ghcr.io/v2/rsfree/xhx2api/tags/list
 
 # 2) 钉住某个提交（把 .env 里那行改掉）
 sed -i 's/^XHX2API_IMAGE_TAG=.*/XHX2API_IMAGE_TAG=sha-02d21d1/' .env

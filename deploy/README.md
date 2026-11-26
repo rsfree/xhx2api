@@ -1,7 +1,7 @@
 # 线上部署（1task.cn）
 
 **已上线**：https://xhx2api.1task.cn（ai-prod = 210.121.44.245，`/opt/xhx2api`，
-容器 `ghcr.io/jushenzhidao/xhx2api:sha-<提交>`，端口 `127.0.0.1:39026`）。
+容器 `ghcr.io/rsfree/xhx2api:sha-<提交>`，端口 `127.0.0.1:39026`）。
 运维手册见 `deploy/ai-prod/README.md`。
 
 目标形态：`https://xhx2api.1task.cn` → nginx（TLS）→ `127.0.0.1:39026` 容器。
